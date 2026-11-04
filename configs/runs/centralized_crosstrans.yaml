@@ -1,0 +1,51 @@
+kind: centralized
+run_type: real
+model_type: crosstrans_mfc
+use_table_evidence: false
+seed: 42
+device: cpu
+output_root: outputs
+
+datasets:
+  - id: mocheg
+    path: datasets/mocheg
+  - id: mmcv
+    path: datasets/mmcv
+    subset: all
+    mmqa_path: datasets/mmqa
+    split:
+      ratios: [0.8, 0.1, 0.1]
+      seed: 42
+
+encoders:
+  text:
+    checkpoint_path: roberta-base
+    revision: null
+    max_length: 128
+  evidence:
+    checkpoint_path: allenai/longformer-base-4096
+    revision: null
+    max_length: 512
+  vision:
+    checkpoint_path: openai/clip-vit-base-patch32
+    revision: null
+
+model:
+  hidden_dim: 256
+  num_heads: 8
+  dropout: 0.1
+  cls_dropout: 0.4
+
+max_text_evidence: 4
+max_image_evidence: 2
+
+training:
+  batch_size: 2
+  epochs: 5
+  learning_rate: 0.0001
+  mode: shared_private
+  private_weight: 0.5
+  patience: 3
+
+evaluation:
+  primary_cohort: all_eligible
