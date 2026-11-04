@@ -26,19 +26,12 @@ def main(argv: list[str] | None = None) -> int:
         command_parser = commands.add_parser(command)
         command_parser.add_argument("--config", type=Path, required=True)
         if command != "matrix":
-            command_parser.add_argument("--resume", type=Path)
             command_parser.add_argument(
                 "--limit", type=int,
                 help="Maximum samples per client in train/dev; default: use all samples",
             )
         if command == "train-local":
             command_parser.add_argument("--dataset")
-    smoke = commands.add_parser("smoke", help="Synthetic CPU mechanics check")
-    smoke.add_argument(
-        "--algorithm", default="fedavg", choices=["fedavg", "fedprox", "fedadam", "evidence_aware"]
-    )
-    smoke.add_argument("--output-root", default="outputs")
-    smoke.add_argument("--seed", type=int, default=42)
     evaluation = commands.add_parser("evaluate")
     evaluation.add_argument("--run-dir", type=Path, required=True)
     evaluation.add_argument("--split", choices=["dev", "test"], default="dev")
@@ -76,16 +69,6 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "freeze-selection":
             freeze_selection(args.run_dir)
             print("Dev selection frozen; test evaluation requires --final")
-        elif args.command == "smoke":
-            folder = run(
-                {
-                    "run_type": "synthetic",
-                    "output_root": args.output_root,
-                    "seed": args.seed,
-                    "fl": {"algorithm": args.algorithm},
-                }
-            )
-            print(folder)
         elif args.command == "matrix":
             from fmfc.experiments.matrix import run_matrix
 
@@ -97,8 +80,6 @@ def main(argv: list[str] | None = None) -> int:
             config["kind"] = args.command.removeprefix("train-")
             if args.command == "train-local" and args.dataset:
                 config["local_client"] = args.dataset
-            if args.resume:
-                config["resume_from"] = str(args.resume)
             if args.limit is not None:
                 config["limit"] = args.limit
             print(run(config, args.command.removeprefix("train-")))

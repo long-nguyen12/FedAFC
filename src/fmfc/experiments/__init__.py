@@ -1,1 +1,1 @@
-"""Reproducible experiment tooling; synthetic runs verify mechanics only."""
+"""Experiment tooling for real-data evidence-conditioned claim verification."""

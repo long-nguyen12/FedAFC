@@ -1,6 +1,4 @@
 kind: federated
-run_type: real
-model_type: crosstrans_mfc
 use_table_evidence: false
 seed: 42
 device: cpu

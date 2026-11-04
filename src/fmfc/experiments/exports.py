@@ -76,7 +76,7 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
         if config.get("kind") in {"local", "centralized"}:
             algorithm = config["kind"]
         seed, comparison = config.get("seed"), config.get("comparison_id")
-        synthetic = metrics.get("synthetic", "unknown")
+        synthetic = metrics.get("synthetic", False)
         dataset_specs = config.get("datasets", [])
         dataset_map = {spec["id"]: _config_key(spec) for spec in dataset_specs}
         dataset_config = _config_key(dataset_specs) if dataset_specs else None

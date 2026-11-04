@@ -9,11 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from fmfc.config import load_config
-from fmfc.data.collator import FeatureCollator
 from fmfc.data.crosstrans import CrossTransCollator
 from fmfc.data.schema import EvidenceItem, VerificationRecord
 from fmfc.environment import resolve_device
@@ -23,11 +21,8 @@ from fmfc.federated.server import ServerState
 from fmfc.model.crosstrans import CrossTransVerifier
 from fmfc.model.encoders import (
     FrozenCLIPImageEncoder,
-    FrozenTextEncoder,
     FrozenTokenTextEncoder,
-    FrozenVisionEncoder,
 )
-from fmfc.model.verifier import Verifier
 from fmfc.seeds import seed_everything
 from fmfc.training.evaluation import evaluate
 from fmfc.training.local import make_optimizer, train_epoch
@@ -40,15 +35,13 @@ def _json(path: Path, payload: Any) -> None:
 def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str, Any]:
     cfg = copy.deepcopy(config)
     cfg.setdefault("kind", kind)
-    cfg.setdefault("run_type", "real")
     cfg.setdefault("seed", 42)
     cfg.setdefault("device", "cpu")
     cfg.setdefault("output_root", "outputs")
     cfg.setdefault("ablation", "all")
-    cfg.setdefault("model_type", "verifier_v1")
     cfg.setdefault("use_table_evidence", cfg.get("model", {}).get("table_dim") is not None)
     for section, defaults in {
-        "model": {"text_dim": 8, "image_dim": 8, "hidden_dim": 16},
+        "model": {"hidden_dim": 256},
         "training": {
             "epochs": 3,
             "batch_size": 8,
@@ -67,12 +60,6 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
             "prox_mu": 0.01,
             "server_learning_rate": 0.01,
         },
-        "synthetic": {
-            "clients": 2,
-            "train_samples": 16,
-            "dev_samples": 8,
-            "mixed_modalities": False,
-        },
         "evaluation": {
             "selection_split": "dev",
             "final_split": "test",
@@ -86,65 +73,7 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
     return cfg
 
 
-def _synthetic_batches(cfg: dict[str, Any], split: str) -> tuple[dict, dict, dict]:
-    """Generate feature tensors, never benchmark rows/media or verified evidence."""
-    count = cfg["synthetic"][f"{split}_samples"]
-    if cfg.get("limit") is not None and split in {"train", "dev"}:
-        count = min(count, cfg["limit"])
-    clients, labels = {}, {}
-    dt, di = cfg["model"]["text_dim"], cfg["model"]["image_dim"]
-    de = cfg["model"].get("evidence_dim", dt)
-    table_dim = cfg["model"].get("table_dim")
-    if cfg["use_table_evidence"]:
-        table_dim = table_dim or dt
-        cfg["model"]["table_dim"] = table_dim
-    for index in range(cfg["synthetic"]["clients"]):
-        client = f"synthetic_{index}"
-        labels[client] = {"SUPPORT": 0, "REFUTE": 1, "NEI": 2}
-        rng = torch.Generator().manual_seed(cfg["seed"] + index * 100 + (split != "train") * 50000)
-        y = torch.arange(count) % 2
-        text = torch.randn(count, 1, de, generator=rng) * 0.1
-        image = torch.randn(count, 1, di, generator=rng) * 0.1
-        text[:, 0, 0] += 1 - 2 * y
-        image[:, 0, 0] += 1 - 2 * y
-        text_mask = torch.ones(count, 1, dtype=torch.bool)
-        image_mask = torch.ones(count, 1, dtype=torch.bool)
-        if cfg["synthetic"]["mixed_modalities"]:
-            text_mask[::3] = False
-            image_mask[1::3] = False
-        full = {
-            "claim_features": torch.randn(count, dt, generator=rng) * 0.1,
-            "text_features": text,
-            "image_features": image,
-            "text_mask": text_mask,
-            "image_mask": image_mask,
-            "global_labels": y,
-            "original_labels": y.clone(),
-            "dataset_ids": [client] * count,
-            "record_ids": [f"synthetic:{client}:{split}:{i}" for i in range(count)],
-        }
-        if table_dim is not None:
-            table = torch.randn(count, 1, table_dim, generator=rng) * 0.1
-            table[:, 0, 0] += 1 - 2 * y
-            table_mask = torch.zeros(count, 1, dtype=torch.bool)
-            # The first client has no tables; the other exercises table-only inputs.
-            if index % 2:
-                table_mask[::3] = True
-                if cfg["synthetic"]["mixed_modalities"]:
-                    text_mask[::3] = False
-                    image_mask[::3] = False
-            full["table_features"], full["table_mask"] = table, table_mask
-        batches = []
-        for start in range(0, count, cfg["training"]["batch_size"]):
-            end = start + cfg["training"]["batch_size"]
-            batch = {key: value[start:end] for key, value in full.items()}
-            batches.append(ablate_batch(batch, cfg["ablation"], cfg["seed"])[0])
-        clients[client] = batches
-    return clients, labels, {"synthetic_generator": "label-signal-features-v1"}
-
-
 def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
-    """Assign whole connected claim/evidence groups, without consulting labels."""
     ratios = policy.get("ratios", [])
     seed = policy.get("seed")
     
@@ -195,24 +124,17 @@ def _real_batches(
         cache = {}
     if "encoders" not in cache:
         encoders = cfg.get("encoders", {})
-        if cfg["model_type"] == "crosstrans_mfc":
-            cache["encoders"] = (
-                FrozenTokenTextEncoder(**{**encoders["text"], "device": cfg["device"]}),
-                FrozenCLIPImageEncoder(**{**encoders["vision"], "device": cfg["device"]}),
-            )
-            cache["evidence_encoder"] = FrozenTokenTextEncoder(
-                **{**encoders["evidence"], "device": cfg["device"]}
-            )
-        else:
-            cache["encoders"] = (
-                FrozenTextEncoder(**{**encoders["text"], "device": cfg["device"]}),
-                FrozenVisionEncoder(**{**encoders["vision"], "device": cfg["device"]}),
-            )
+        cache["encoders"] = (
+            FrozenTokenTextEncoder(**{**encoders["text"], "device": cfg["device"]}),
+            FrozenCLIPImageEncoder(**{**encoders["vision"], "device": cfg["device"]}),
+        )
+        cache["evidence_encoder"] = FrozenTokenTextEncoder(
+            **{**encoders["evidence"], "device": cfg["device"]}
+        )
     text_encoder, vision_encoder = cache["encoders"]
     cfg["model"]["text_dim"] = text_encoder.output_dim
     cfg["model"]["image_dim"] = vision_encoder.output_dim
-    if cfg["model_type"] == "crosstrans_mfc":
-        cfg["model"]["evidence_dim"] = cache["evidence_encoder"].output_dim
+    cfg["model"]["evidence_dim"] = cache["evidence_encoder"].output_dim
     clients, labels, sources = {}, {}, {}
     for spec in specs:
         dataset = spec["id"]
@@ -225,8 +147,6 @@ def _real_batches(
             else:
                 from fmfc.data.mmcv import get_dataset
 
-                if not spec.get("split"):
-                    raise ValueError("MMCV requires an explicit grouped split policy in datasets[].split")
                 claims, table_claims = get_dataset(
                     spec["path"], subset=spec.get("subset", "all"), mmqa_path=spec.get("mmqa_path")
                 )
@@ -268,23 +188,13 @@ def _real_batches(
             "max_text_evidence": cfg.get("max_text_evidence", 4),
             "max_image_evidence": cfg.get("max_image_evidence", 2),
         }
-        if cfg["model_type"] == "crosstrans_mfc":
-            collator = CrossTransCollator(
-                text_encoder, cache["evidence_encoder"], vision_encoder, label_map, **budgets,
-            )
-            clients[dataset] = [
-                collator.defer(records[start:start + size], cfg["ablation"], cfg["seed"])
-                for start in range(0, len(records), size)
-            ]
-        else:
-            collator = FeatureCollator(
-                text_encoder, vision_encoder, label_map,
-                text_encoder.output_dim, vision_encoder.output_dim, **budgets,
-            )
-            clients[dataset] = [
-                ablate_batch(collator(records[start:start + size]), cfg["ablation"], cfg["seed"])[0]
-                for start in range(0, len(records), size)
-            ]
+        collator = CrossTransCollator(
+            text_encoder, cache["evidence_encoder"], vision_encoder, label_map, **budgets,
+        )
+        clients[dataset] = [
+            collator.defer(records[start:start + size], cfg["ablation"], cfg["seed"])
+            for start in range(0, len(records), size)
+        ]
         labels[dataset] = label_map
         sources[dataset] = {
             "path": str(spec["path"]), **metadata,
@@ -296,11 +206,7 @@ def _real_batches(
 
 
 def _data(cfg: dict[str, Any], split: str, real_cache: dict | None = None) -> tuple[dict, dict, dict]:
-    data, labels, sources = (
-        _synthetic_batches(cfg, split)
-        if cfg["run_type"] == "synthetic"
-        else _real_batches(cfg, split, real_cache)
-    )
+    data, labels, sources = _real_batches(cfg, split, real_cache)
     limit = cfg.get("limit")
     if limit is None or split not in {"train", "dev"}:
         return data, labels, sources
@@ -325,7 +231,7 @@ def _data(cfg: dict[str, Any], split: str, real_cache: dict | None = None) -> tu
     return limited, labels, sources
 
 
-def _metrics(models: dict[str, Verifier], data: dict, cfg: dict) -> dict[str, Any]:
+def _metrics(models: dict[str, CrossTransVerifier], data: dict, cfg: dict) -> dict[str, Any]:
     reports = {
         client: evaluate(models[client], batches, device=cfg["device"])
         for client, batches in data.items()
@@ -343,28 +249,16 @@ def _metrics(models: dict[str, Verifier], data: dict, cfg: dict) -> dict[str, An
         "clients": reports,
         "mean_client_binary_macro_f1": sum(values) / len(values) if values else None,
         "worst_client_binary_macro_f1": min(values) if values else None,
-        "synthetic": cfg["run_type"] == "synthetic",
         "selection_split": "dev",
         "protocol": "evidence-conditioned verification",
         "ablation": cfg["ablation"],
         "primary_cohort": cfg["evaluation"]["primary_cohort"],
-        "real_client_count": 0 if cfg["run_type"] == "synthetic" else len(cfg["datasets"]),
+        "real_client_count": len(cfg["datasets"]),
         "pseudo_client_count": cfg.get("pseudo_clients", 1),
         "evidence_sufficiency_unknown_after_ablation": cfg["ablation"] not in {"all", "both"},
         "original_head_trained": cfg["training"]["mode"] == "shared_private"
         and cfg["training"]["private_weight"] > 0,
     }
-
-
-def _restore_rng(state: dict) -> None:
-    random.setstate(state["python"])
-    numpy = state["numpy"]
-    np.random.set_state((numpy[0], np.asarray(numpy[1], dtype=np.uint32), *numpy[2:]))
-    torch.set_rng_state(state["torch"])
-    if state.get("cuda"):
-        if not torch.cuda.is_available():
-            raise ValueError("CUDA RNG checkpoint requires compatible CUDA hardware")
-        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def run(config: dict[str, Any], kind: str = "federated") -> Path:
@@ -386,8 +280,7 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         **cfg["model"],
         "private_labels": {key: len(value) for key, value in labels.items()},
     }
-    model_class = CrossTransVerifier if cfg["model_type"] == "crosstrans_mfc" else Verifier
-    initial = model_class(**model_args).to(cfg["device"])
+    initial = CrossTransVerifier(**model_args).to(cfg["device"])
     for dataset, head in initial.private_heads.items():
         # Dataset-specific initialization must not depend on client ordering.
         with torch.random.fork_rng(devices=[]):
@@ -425,18 +318,6 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         conflict_beta=fl.get("conflict_beta", 0.5),
     )
     history, step, best, stale = [], 0, -1.0, 0
-    if cfg.get("resume_from"):
-        resume = torch.load(cfg["resume_from"], map_location="cpu", weights_only=True)
-        server.load_state_dict(resume["server"])
-        for name, client in clients.items():
-            client.load_state_dict(resume["clients"][name])
-        step, best, stale, history = (
-            resume["step"],
-            resume["best"],
-            resume["stale"],
-            resume["history"],
-        )
-        _restore_rng(resume["rng"])
     run_id = cfg.get("run_id") or datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     if Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("run_id must be a single directory name")
@@ -480,8 +361,6 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         step += 1
         metrics = _metrics(models, dev, cfg)
         score = metrics["mean_client_binary_macro_f1"]
-        if score is None:
-            raise ValueError("No binary-eligible dev examples; selection is undefined")
         improved = score > best
         best, stale = (score, 0) if improved else (best, stale + 1)
         history.append(
@@ -493,7 +372,6 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             }
         )
         if improved:
-            # Keep the selected state independent of later training updates.
             selected_state = {
                 "step": step,
                 "server": server.state_dict(),
@@ -502,12 +380,6 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         patience = cfg["training"]["patience"]
         if patience and stale >= patience:
             break
-    if selected_state is None:
-        # A resumed run may not improve on its already selected dev checkpoint.
-        old_selected = Path(cfg["resume_from"]).with_name("selected.pt")
-        if not old_selected.is_file():
-            raise ValueError("Resume requires the matching selected.pt checkpoint")
-        selected_state = torch.load(old_selected, map_location="cpu", weights_only=True)
     _load_selected(clients, selected_state, cfg)
     torch.save(
         {
@@ -537,7 +409,6 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             },
         )
         _json(folder / "round_history.json", server.history)
-    _json(folder / "timing.json", {"wall_seconds": time.perf_counter() - started})
     return folder
 
 
@@ -586,8 +457,6 @@ def evaluate_run(
             raise ValueError("Test is locked; freeze selection and pass --final")
         if (folder / "metrics_test.json").exists():
             raise ValueError("Final test evaluation already exists")
-        if cfg["run_type"] == "synthetic":
-            raise ValueError("Synthetic smoke runs have no final benchmark test split")
     elif final:
         raise ValueError("--final applies only to test")
     state = torch.load(
@@ -605,8 +474,7 @@ def evaluate_run(
             for key, value in labels.items()
             if any(param.startswith(f"private_heads.{key}.") for param in payload["model"])
         }
-        model_class = CrossTransVerifier if cfg.get("model_type") == "crosstrans_mfc" else Verifier
-        model = model_class(**cfg["model"], private_labels=local_labels)
+        model = CrossTransVerifier(**cfg["model"], private_labels=local_labels)
         model.load_state_dict(payload["model"])
         if cfg["kind"] == "federated":
             model.load_shared_state(state["server"]["shared"])
