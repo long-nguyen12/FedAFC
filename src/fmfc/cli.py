@@ -1,4 +1,4 @@
-"""Evidence-conditioned verification: train, evaluate and export."""
+"""Evidence-conditioned verification: train, evaluate, explain and export."""
 
 import argparse
 import json
@@ -39,6 +39,16 @@ def main(argv: list[str] | None = None) -> int:
     evaluation.add_argument(
         "--ablation", choices=["all", "both", "text", "image", "table", "shuffle_image", "drop_image", "drop_table"]
     )
+    explanation = commands.add_parser("explain", help="Explain best_model.pt using evidence removal")
+    explanation.add_argument("--config", type=Path, required=True)
+    explanation.add_argument("--checkpoint", type=Path, required=True)
+    explanation.add_argument("--dataset", required=True)
+    explanation.add_argument("--split", choices=["train", "dev"], default="dev")
+    explanation.add_argument("--record-id", help="Exact record ID, for example mocheg:123")
+    explanation.add_argument("--limit", type=int, default=1)
+    explanation.add_argument("--head", choices=["global", "original"], default="global")
+    explanation.add_argument("--top-k", type=int, default=1)
+    explanation.add_argument("--output", type=Path, help="Optional JSON export; default: print only")
     freeze = commands.add_parser("freeze-selection")
     freeze.add_argument("--run-dir", type=Path, required=True)
     export = commands.add_parser("export-results")
@@ -57,6 +67,22 @@ def main(argv: list[str] | None = None) -> int:
             from fmfc.experiments.exports import export_results
 
             print(json.dumps(export_results(args.runs_root, args.output), indent=2))
+            return 0
+        if args.command == "explain":
+            from fmfc.experiments.explain import explain_checkpoint
+
+            result = explain_checkpoint(
+                load_config(args.config), args.checkpoint, args.dataset,
+                split=args.split, limit=args.limit, record_id=args.record_id,
+                head=args.head, top_k=args.top_k,
+            )
+            content = json.dumps(result, indent=2, ensure_ascii=False)
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(content + "\n", encoding="utf-8")
+                print(args.output)
+            else:
+                print(content)
             return 0
         from fmfc.experiments.runner import evaluate_run, freeze_selection, run
 

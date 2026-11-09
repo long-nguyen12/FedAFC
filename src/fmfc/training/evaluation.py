@@ -4,6 +4,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import torch
+from tqdm import tqdm
 
 from fmfc.model.verifier import Verifier
 from fmfc.training.local import to_device
@@ -35,7 +36,8 @@ def classification_metrics(
 
 @torch.inference_mode()
 def evaluate(
-    model: Verifier, batches: Iterable[Mapping[str, Any]], *, device: str = "cpu"
+    model: Verifier, batches: Iterable[Mapping[str, Any]], *, device: str = "cpu",
+    progress_desc: str = "Val",
 ) -> dict[str, Any]:
     model.to(device).eval()
     targets: list[int] = []
@@ -45,7 +47,8 @@ def evaluate(
     original: dict[str, tuple[list[int], list[int]]] = {}
     seen = eligible = strict = table_count = 0
     has_table_mask = False
-    for raw_batch in batches:
+    progress = tqdm(batches, desc=progress_desc, unit="batch", dynamic_ncols=True)
+    for raw_batch in progress:
         batch = to_device(raw_batch, device)
         output = model(batch)
         text = batch["text_mask"].any(1)
@@ -73,6 +76,7 @@ def evaluate(
             actual, predicted = original.setdefault(dataset, ([], []))
             actual.extend(labels[valid_private].cpu().tolist())
             predicted.extend(logits[valid_private].argmax(1).cpu().tolist())
+        progress.set_postfix(samples=seen, refresh=False)
     return {
         "binary": classification_metrics(targets, predictions, 2),
         "strict_binary": classification_metrics(strict_targets, strict_predictions, 2),

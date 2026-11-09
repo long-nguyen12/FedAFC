@@ -1,26 +1,42 @@
-"""Token-level, batch-wise encoding for the CrossTrans image adapter."""
+"""Token-level, batch-wise encoding for the CrossTrans text/image/table adapter."""
 
+import os
+import re
+from pathlib import Path
 from typing import Any
 
 import torch
+from torch import Tensor
 
-from fmfc.data.schema import VerificationRecord
+from fmfc.data.schema import VerificationRecord, serialize_table_rows
+
+Row = dict[str, Tensor]
 
 
 class CrossTransCollator:
     def __init__(
         self, claim_encoder: Any, evidence_encoder: Any, vision_encoder: Any,
         original_label_mapping: dict[str, int], max_text_evidence: int = 4,
-        max_image_evidence: int = 2,
+        max_image_evidence: int = 2, max_table_evidence: int | None = None,
+        max_table_tokens: int | None = None, cache_dir: str | Path | None = None,
     ) -> None:
         if min(max_text_evidence, max_image_evidence) < 1:
             raise ValueError("Evidence budgets must be positive")
+        if (max_table_evidence is None) != (max_table_tokens is None) or (
+            max_table_evidence is not None and min(max_table_evidence, max_table_tokens) < 1
+        ):
+            raise ValueError("Table evidence and token budgets must both be positive or unset")
         self.claim_encoder = claim_encoder
         self.evidence_encoder = evidence_encoder
         self.vision_encoder = vision_encoder
         self.labels = original_label_mapping
         self.max_text = max_text_evidence
         self.max_image = max_image_evidence
+        self.max_table = max_table_evidence
+        self.max_table_tokens = max_table_tokens
+        # Frozen features per record. Entries are never invalidated automatically:
+        # the user picks a new directory when encoders, budgets or evidence change.
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
     def defer(
         self, records: list[VerificationRecord], ablation: str = "all", seed: int = 42,
@@ -38,37 +54,113 @@ class CrossTransCollator:
     def __call__(self, records: list[VerificationRecord]) -> dict[str, Any]:
         if not records:
             raise ValueError("Cannot collate an empty batch")
-        if any(item.kind == "table" for row in records for item in row.evidence):
-            raise ValueError("CrossTrans image adapter does not accept table evidence")
-        batch = len(records)
-        texts = [[e for e in row.evidence if e.kind == "text"] for row in records]
-        images = [[e for e in row.evidence if e.kind == "image"] for row in records]
-        claim_features, claim_mask = self.claim_encoder.encode_tokens([
-            row.claim_text for row in records
-        ])
-        text_indices = [i for i, items in enumerate(texts) if items]
-        text_features = torch.zeros(batch, 0, self.evidence_encoder.output_dim)
-        text_mask = torch.zeros(batch, 0, dtype=torch.bool)
-        if text_indices:
-            separator = self.evidence_encoder.tokenizer.sep_token or "[SEP]"
-            content = [f" {separator} ".join(
-                e.text for e in texts[i][:self.max_text]
-            ) for i in text_indices]
-            features, masks = self.evidence_encoder.encode_tokens(content)
-            text_features = torch.zeros(batch, features.shape[1], features.shape[2])
-            text_mask = torch.zeros(batch, features.shape[1], dtype=torch.bool)
-            text_features[text_indices] = features
-            text_mask[text_indices] = masks
-        image_slots = min(self.max_image, max(len(items) for items in images))
-        image_features = torch.zeros(batch, image_slots, self.vision_encoder.output_dim)
-        image_mask = torch.zeros(batch, image_slots, dtype=torch.bool)
-        for index, items in enumerate(images):
-            selected = items[:self.max_image]
+        if self.max_table is None and any(self._items(r, "table") for r in records):
+            raise ValueError("Table evidence requires a table-enabled CrossTrans collator")
+        rows = self._encode_rows(records) if self.cache_dir is None else self._cached_rows(records)
+        return self._assemble(records, rows)
+
+    @staticmethod
+    def _items(record: VerificationRecord, kind: str) -> list[Any]:
+        return [item for item in record.evidence if item.kind == kind]
+
+    def _encode_rows(self, records: list[VerificationRecord]) -> list[Row]:
+        """Encode one batch, then keep each record's frozen features without padding."""
+        rows: list[Row] = [{} for _ in records]
+        features, masks = self.claim_encoder.encode_tokens([r.claim_text for r in records])
+        for row, states, mask in zip(rows, features, masks, strict=True):
+            row["claim"] = states[mask]
+        separator = self.evidence_encoder.tokenizer.sep_token or "[SEP]"
+        texts = [self._items(r, "text") for r in records]
+        self._encode_sequences(rows, "text", {
+            index: f" {separator} ".join(item.text for item in items[:self.max_text])
+            for index, items in enumerate(texts) if items
+        })
+        for row, record in zip(rows, records, strict=True):
+            selected = self._items(record, "image")[:self.max_image]
             if selected:
-                features = self.vision_encoder.encode_paths([e.image_path for e in selected])
-                image_features[index, :len(selected)] = features
-                image_mask[index, :len(selected)] = True
-        return {
+                row["image"] = self.vision_encoder.encode_paths([e.image_path for e in selected])
+        if self.max_table is not None:
+            # Tables are a separate token stream from the same frozen evidence encoder.
+            tables = [self._items(r, "table") for r in records]
+            self._encode_sequences(rows, "table", {
+                index: f" {separator} ".join(
+                    serialize_table_rows(item.table) for item in items[:self.max_table]
+                )
+                for index, items in enumerate(tables) if items
+            }, max_length=self.max_table_tokens)
+        return rows
+
+    def _encode_sequences(
+        self, rows: list[Row], key: str, contents: dict[int, str], max_length: int | None = None,
+    ) -> None:
+        if not contents:
+            return
+        options = {} if max_length is None else {"max_length": max_length}
+        features, masks = self.evidence_encoder.encode_tokens(list(contents.values()), **options)
+        for index, states, mask in zip(contents, features, masks, strict=True):
+            rows[index][key] = states[mask]
+
+    def _cache_path(self, record: VerificationRecord) -> Path:
+        parts = (record.dataset_id, record.split, record.record_id)
+        name = [re.sub(r"[^A-Za-z0-9._-]", "_", part) for part in parts]
+        return self.cache_dir / name[0] / name[1] / f"{name[2]}.pt"
+
+    def _cached_rows(self, records: list[VerificationRecord]) -> list[Row]:
+        """Reuse cached frozen features; encode and store only records not cached yet.
+
+        Features are stored as float16 and always used at that precision, so the
+        epoch that fills the cache sees the same inputs as every later epoch.
+        """
+        paths = [self._cache_path(record) for record in records]
+        rows = [torch.load(path, weights_only=True) if path.is_file() else None for path in paths]
+        missing = [index for index, row in enumerate(rows) if row is None]
+        if missing:
+            encoded = self._encode_rows([records[index] for index in missing])
+            for index, row in zip(missing, encoded, strict=True):
+                stored = {key: value.to(torch.float16) for key, value in row.items()}
+                paths[index].parent.mkdir(parents=True, exist_ok=True)
+                # Write then rename, so an interrupted run never leaves a partial entry.
+                temporary = paths[index].with_name(f"{paths[index].name}.{os.getpid()}.tmp")
+                torch.save(stored, temporary)
+                os.replace(temporary, paths[index])
+                rows[index] = stored
+        for record, row in zip(records, rows, strict=True):
+            self._check_cached(record, row)
+        return [{key: value.float() for key, value in row.items()} for row in rows]
+
+    def _check_cached(self, record: VerificationRecord, row: Row) -> None:
+        """Fail instead of silently dropping evidence when a cache came from other settings."""
+        expected = {"claim"} | {kind for kind in ("text", "image") if self._items(record, kind)}
+        if self.max_table is not None and self._items(record, "table"):
+            expected.add("table")
+        images = min(len(self._items(record, "image")), self.max_image)
+        if set(row) != expected or (images and row["image"].shape[0] != images):
+            raise ValueError(
+                f"Cached features of {record.record_id} do not match this configuration; "
+                "use a new feature_cache_dir"
+            )
+
+    def _assemble(self, records: list[VerificationRecord], rows: list[Row]) -> dict[str, Any]:
+        """Pad per-record features back into batch tensors; padding stays zero and masked."""
+        batch = len(records)
+
+        def pad(key: str, dim: int) -> tuple[Tensor, Tensor]:
+            length = max((row[key].shape[0] for row in rows if key in row), default=0)
+            features = torch.zeros(batch, length, dim)
+            mask = torch.zeros(batch, length, dtype=torch.bool)
+            for index, row in enumerate(rows):
+                if key in row:
+                    size = row[key].shape[0]
+                    features[index, :size] = row[key]
+                    mask[index, :size] = True
+            return features, mask
+
+        claim_features, claim_mask = pad("claim", self.claim_encoder.output_dim)
+        text_features, text_mask = pad("text", self.evidence_encoder.output_dim)
+        image_features, image_mask = pad("image", self.vision_encoder.output_dim)
+        counts = {kind: [len(self._items(r, kind)) for r in records]
+                  for kind in ("text", "image", "table")}
+        result = {
             "claim_features": claim_features, "claim_mask": claim_mask,
             "text_features": text_features, "text_mask": text_mask,
             "image_features": image_features, "image_mask": image_mask,
@@ -79,7 +171,18 @@ class CrossTransCollator:
             "dataset_ids": [r.dataset_id for r in records],
             "record_ids": [r.record_id for r in records],
             "truncation": {
-                "text_evidence": sum(max(0, len(x) - self.max_text) for x in texts),
-                "image_evidence": sum(max(0, len(x) - self.max_image) for x in images),
+                "text_evidence": sum(max(0, n - self.max_text) for n in counts["text"]),
+                "image_evidence": sum(max(0, n - self.max_image) for n in counts["image"]),
             },
         }
+        if self.max_table is not None:
+            result["table_features"], result["table_mask"] = pad(
+                "table", self.evidence_encoder.output_dim,
+            )
+            result["truncation"]["table_evidence"] = sum(
+                max(0, n - self.max_table) for n in counts["table"]
+            )
+            result["truncation"]["table_tokens"] = sum(
+                row["table"].shape[0] >= self.max_table_tokens for row in rows if "table" in row
+            )
+        return result

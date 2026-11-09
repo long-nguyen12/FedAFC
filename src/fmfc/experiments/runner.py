@@ -25,7 +25,7 @@ from fmfc.model.encoders import (
 )
 from fmfc.seeds import seed_everything
 from fmfc.training.evaluation import evaluate
-from fmfc.training.local import make_optimizer, train_epoch
+from fmfc.training.local import make_optimizer, presence_log_priors, train_epoch
 
 
 def _json(path: Path, payload: Any) -> None:
@@ -51,6 +51,10 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
             "global_weight": 1.0,
             "private_weight": 0.0,
             "patience": 0,
+            "reshuffle_records": False,
+            "max_grad_norm": 0.0,
+            "warmup_steps": 0,
+            "logit_adjustment": 0.0,
         },
         "fl": {
             "algorithm": "fedavg",
@@ -87,11 +91,13 @@ def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
         return index
 
     seen = {}
-    for index, (claim, texts, images, _, _) in enumerate(claims):
+    for index, (claim, texts, images, _, _, tables) in enumerate(claims):
         keys = [("claim", " ".join(claim.casefold().split()))]
         keys.extend(("text", " ".join(text.casefold().split())) for text in texts
                     if isinstance(text, str) and text.strip())
         keys.extend(("image", path.replace("\\", "/").casefold()) for path in images)
+        keys.extend(("table", json.dumps(table, sort_keys=True, ensure_ascii=False))
+                    for table in tables)
         for key in keys:
             if key in seen:
                 parent[root(index)] = root(seen[key])
@@ -135,6 +141,10 @@ def _real_batches(
     cfg["model"]["text_dim"] = text_encoder.output_dim
     cfg["model"]["image_dim"] = vision_encoder.output_dim
     cfg["model"]["evidence_dim"] = cache["evidence_encoder"].output_dim
+    # Tables are serialized and encoded by the same frozen evidence encoder.
+    cfg["model"]["table_dim"] = (
+        cache["evidence_encoder"].output_dim if cfg["use_table_evidence"] else None
+    )
     clients, labels, sources = {}, {}, {}
     for spec in specs:
         dataset = spec["id"]
@@ -147,17 +157,24 @@ def _real_batches(
             else:
                 from fmfc.data.mmcv import get_dataset
 
-                claims, table_claims = get_dataset(
+                claims = get_dataset(
                     spec["path"], subset=spec.get("subset", "all"), mmqa_path=spec.get("mmqa_path")
                 )
                 parts = _mmcv_splits(claims, spec["split"])
                 metadata = {
-                    "split_protocol": "grouped claim/text-content/image-path v1",
+                    "split_protocol": "grouped claim/text-content/image-path/table-content v2",
                     "split_policy": spec["split"],
-                    "quarantined_table_claims": len(table_claims),
+                    "table_claims": sum(bool(row[5]) for row in claims),
                     "subset": spec.get("subset", "all"),
                     "mmqa_path": spec.get("mmqa_path"),
                 }
+            if not cfg["use_table_evidence"] and any(
+                len(row) > 5 and row[5] for rows in parts.values() for row in rows
+            ):
+                raise ValueError(
+                    f"{dataset} has table evidence; set use_table_evidence: true "
+                    "(tables are never silently discarded)"
+                )
             vocabulary = sorted({str(row[3]) for rows in parts.values() for row in rows})
             label_map = {label: index for index, label in enumerate(vocabulary)}
             cache[dataset] = parts, label_map, metadata
@@ -168,7 +185,9 @@ def _real_batches(
         global_map = {"supported": "SUPPORT", "refuted": "REFUTE",
                       "SUPPORT": "SUPPORT", "REFUTE": "REFUTE"}
         records = []
-        for claim, texts, images, label, claim_id in rows:
+        for row in rows:
+            claim, texts, images, label, claim_id = row[:5]
+            tables = row[5] if len(row) > 5 else ()
             record_id = f"{dataset}:{claim_id}"
             evidence = []
             for kind, values in (("text", texts), ("image", images)):
@@ -179,6 +198,10 @@ def _real_batches(
                         evidence.append(EvidenceItem(
                             f"{record_id}:{kind}:{index}", kind, record_id, **content
                         ))
+            evidence.extend(
+                EvidenceItem(f"{record_id}:table:{index}", "table", record_id, table=table)
+                for index, table in enumerate(tables)
+            )
             records.append(VerificationRecord(
                 record_id=record_id, dataset_id=dataset, split=split, claim_text=claim,
                 evidence=tuple(evidence), original_label=str(label), global_label=global_map.get(label),
@@ -188,8 +211,12 @@ def _real_batches(
             "max_text_evidence": cfg.get("max_text_evidence", 4),
             "max_image_evidence": cfg.get("max_image_evidence", 2),
         }
+        if cfg["use_table_evidence"]:
+            budgets["max_table_evidence"] = cfg.get("max_table_evidence", 2)
+            budgets["max_table_tokens"] = cfg.get("max_table_tokens", 1024)
         collator = CrossTransCollator(
             text_encoder, cache["evidence_encoder"], vision_encoder, label_map, **budgets,
+            cache_dir=cfg.get("feature_cache_dir"),
         )
         clients[dataset] = [
             collator.defer(records[start:start + size], cfg["ablation"], cfg["seed"])
@@ -203,6 +230,22 @@ def _real_batches(
             "encoders": {"text": text_encoder.fingerprint, "vision": vision_encoder.fingerprint},
         }
     return clients, labels, sources
+
+
+def _reshuffled_batches(batches: list[dict], size: int) -> list[dict]:
+    """Re-chunk shuffled records so batch composition changes every epoch/round.
+
+    Batches of one client share one collator (one label map), so datasets never mix.
+    """
+    if not batches:
+        return []
+    first = batches[0]
+    records = [record for batch in batches for record in batch["_records"]]
+    random.shuffle(records)
+    return [
+        first["_collator"].defer(records[start:start + size], first["_ablation"], first["_seed"])
+        for start in range(0, len(records), size)
+    ]
 
 
 def _data(cfg: dict[str, Any], split: str, real_cache: dict | None = None) -> tuple[dict, dict, dict]:
@@ -231,9 +274,14 @@ def _data(cfg: dict[str, Any], split: str, real_cache: dict | None = None) -> tu
     return limited, labels, sources
 
 
-def _metrics(models: dict[str, CrossTransVerifier], data: dict, cfg: dict) -> dict[str, Any]:
+def _metrics(
+    models: dict[str, CrossTransVerifier], data: dict, cfg: dict, *, progress_desc: str = "Val",
+) -> dict[str, Any]:
     reports = {
-        client: evaluate(models[client], batches, device=cfg["device"])
+        client: evaluate(
+            models[client], batches, device=cfg["device"],
+            progress_desc=f"{progress_desc} | {client}",
+        )
         for client, batches in data.items()
     }
     for report in reports.values():
@@ -325,21 +373,36 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     folder.mkdir(parents=True, exist_ok=False)
     target = fl["rounds"] if cfg["kind"] == "federated" else cfg["training"]["epochs"]
     train_kwargs = {
-        key: cfg["training"][key] for key in ("mode", "global_weight", "private_weight")
+        key: cfg["training"][key]
+        for key in ("mode", "global_weight", "private_weight", "max_grad_norm", "warmup_steps",
+                    "logit_adjustment")
     }
     train_kwargs["device"] = cfg["device"]
+    batch_size, reshuffle = cfg["training"]["batch_size"], cfg["training"]["reshuffle_records"]
+    priors = {}
+    if cfg["training"]["logit_adjustment"]:
+        if cfg["ablation"] not in {"all", "both"}:
+            raise ValueError("Logit-adjustment priors assume unablated training evidence")
+        # Each client's own train records; keys carry the dataset, so pooling is safe.
+        priors = {client: presence_log_priors(batches) for client, batches in train.items()}
     selected_state = None
+    step_label = "Round" if cfg["kind"] == "federated" else "Epoch"
     while step < target:
         stats = {}
         if cfg["kind"] == "federated":
             updates = []
             for client_id, client in clients.items():
                 client.broadcast(server.shared_state())
-                batches = random.sample(train[client_id], len(train[client_id]))
+                batches = (
+                    _reshuffled_batches(train[client_id], batch_size) if reshuffle
+                    else random.sample(train[client_id], len(train[client_id]))
+                )
                 update = client.train(
                     batches,
                     epochs=fl["local_epochs"],
                     **train_kwargs,
+                    log_priors=priors.get(client_id),
+                    progress_desc=f"Train | Round {step + 1}/{target}",
                     prox_mu=fl["prox_mu"] if fl["algorithm"] == "fedprox" else 0.0,
                 )
                 updates.append(update)
@@ -351,15 +414,22 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             for client in clients.values():
                 client.broadcast(shared)
         else:
-            pooled = [batch for batches in train.values() for batch in batches]
+            pooled = [
+                batch for batches in train.values()
+                for batch in (_reshuffled_batches(batches, batch_size) if reshuffle else batches)
+            ]
             stats["pooled"] = train_epoch(
                 initial,
                 random.sample(pooled, len(pooled)),
                 clients["pooled"].optimizer,
                 **train_kwargs,
+                log_priors={key: value for part in priors.values() for key, value in part.items()},
+                progress_desc=f"Train | {cfg['kind']} | Epoch {step + 1}/{target}",
             )
         step += 1
-        metrics = _metrics(models, dev, cfg)
+        metrics = _metrics(
+            models, dev, cfg, progress_desc=f"Val | {step_label} {step}/{target}",
+        )
         score = metrics["mean_client_binary_macro_f1"]
         improved = score > best
         best, stale = (score, 0) if improved else (best, stale + 1)
@@ -392,7 +462,10 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         },
         folder / "best_model.pt",
     )
-    metrics = _metrics(models, dev, cfg)
+    metrics = _metrics(
+        models, dev, cfg,
+        progress_desc=f"Val | Selected {step_label.lower()} {selected_state['step']}",
+    )
     metrics["selected_step"] = selected_state["step"]
     _json(folder / "metrics_dev.json", metrics)
     _json(folder / "metrics.json", {"dev": metrics})
@@ -485,7 +558,7 @@ def evaluate_run(
                 else ablate_batch(batch, ablation, cfg["seed"])[0]
                 for batch in data[name]
             ]
-    metrics = _metrics(models, data, cfg)
+    metrics = _metrics(models, data, cfg, progress_desc="Test" if split == "test" else "Val")
     metrics["evaluation_split"] = split
     metrics["ablation"] = ablation or cfg["ablation"]
     metrics["robustness_only"] = metrics["ablation"] in {"shuffle_image", "drop_image", "drop_table"}

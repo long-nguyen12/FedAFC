@@ -32,8 +32,10 @@ def _forbidden(value: Any) -> None:
 
 
 def _table(value: Any) -> None:
-    if not isinstance(value, dict) or set(value) != {"header", "rows"}:
-        raise ValueError("Table must contain exactly header and rows")
+    if not isinstance(value, dict) or set(value) - {"title"} != {"header", "rows"}:
+        raise ValueError("Table must contain header, rows and an optional title")
+    if "title" in value:
+        _text(value["title"], "Table title")
     header, rows = value["header"], value["rows"]
     if not isinstance(header, list) or not header or any(not isinstance(x, str) for x in header):
         raise ValueError("Table header must be a nonempty list of strings")
@@ -48,11 +50,26 @@ def serialize_table(table: dict[str, Any]) -> str:
     """Encode only ordered cell/header content, with explicit row/column roles."""
     _table(table)
     lines = ["[TABLE]"]
+    if "title" in table:
+        lines.append(f"[TITLE] {json.dumps(table['title'], ensure_ascii=False)}")
     for index, row in enumerate(table["rows"]):
         cells = [f"[COLUMN {column} {json.dumps(header, ensure_ascii=False)}] "
                  f"{json.dumps(cell, ensure_ascii=False)}"
                  for column, (header, cell) in enumerate(zip(table["header"], row, strict=True))]
         lines.append(f"[ROW {index}] " + " ".join(cells))
+    return "\n".join(lines)
+
+
+def serialize_table_rows(table: dict[str, Any]) -> str:
+    """Compact form for the CrossTrans table branch: header once, cells in column order.
+
+    Repeating headers per cell (serialize_table) pushes 95% of MMQA tables past
+    512 Longformer tokens; this form keeps ~96% of them within 1024.
+    """
+    _table(table)
+    lines = [f"[TITLE] {table['title']}"] if "title" in table else []
+    lines.append("[HEADER] " + " | ".join(table["header"]))
+    lines.extend(f"[ROW {index}] " + " | ".join(row) for index, row in enumerate(table["rows"]))
     return "\n".join(lines)
 
 

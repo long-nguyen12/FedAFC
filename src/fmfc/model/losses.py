@@ -11,10 +11,6 @@ def compute_loss(
     outputs: Mapping[str, Any], batch: Mapping[str, Any], *, mode: str = "binary_only",
     global_weight: float = 1.0, private_weight: float = 1.0,
 ) -> dict[str, Tensor]:
-    if mode not in {"binary_only", "shared_private"}:
-        raise ValueError("mode must be binary_only or shared_private")
-    if global_weight < 0 or private_weight < 0:
-        raise ValueError("Loss weights must be nonnegative")
     valid_evidence = batch["text_mask"].any(1) | batch["image_mask"].any(1)
     if "table_mask" in batch:
         valid_evidence |= batch["table_mask"].any(1)

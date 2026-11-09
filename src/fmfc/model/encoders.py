@@ -15,57 +15,23 @@ class EncoderProtocol(Protocol):
     def encode(self, texts: Sequence[str]) -> Tensor: ...
 
 
-class TinyTextEncoder:
-    """Deterministic byte-count features for synthetic mechanics."""
-
-    def __init__(self, output_dim: int = 16) -> None:
-        if output_dim <= 0:
-            raise ValueError("output_dim must be positive")
-        self.output_dim = output_dim
-        self.fingerprint = f"synthetic-byte-text-v1:{output_dim}"
-
-    def encode(self, texts: Sequence[str]) -> Tensor:
-        result = torch.zeros((len(texts), self.output_dim))
-        for row, text in enumerate(texts):
-            for value in text.lower().encode("utf-8"):
-                result[row, value % self.output_dim] += 1.0
-        return torch.nn.functional.normalize(result, dim=-1)
-
-
-class TinyVisionEncoder:
-    """Fixed image-tensor pooling for synthetic tensors; does not read media files."""
-
-    def __init__(self, output_dim: int = 12) -> None:
-        if output_dim <= 0:
-            raise ValueError("output_dim must be positive")
-        self.output_dim = output_dim
-        self.fingerprint = f"synthetic-pool-vision-v1:{output_dim}"
-
-    def encode(self, pixels: Tensor) -> Tensor:
-        if pixels.ndim != 4:
-            raise ValueError("Expected image tensors [N,C,H,W]")
-        if pixels.shape[0] == 0:
-            return pixels.new_zeros((0, self.output_dim))
-        return torch.nn.functional.adaptive_avg_pool1d(
-            pixels.flatten(1).unsqueeze(1), self.output_dim
-        ).squeeze(1)
-
-    def encode_paths(self, paths: Sequence[str]) -> Tensor:
-        if paths:
-            raise ValueError("TinyVisionEncoder accepts synthetic tensors, not benchmark media")
-        return torch.zeros((0, self.output_dim))
-
-
 class FrozenTextEncoder:
     def __init__(
-        self, checkpoint_path: str | Path, revision: str | None = None,
-        max_length: int = 256, device: str = "cpu",
+        self,
+        checkpoint_path: str | Path,
+        revision: str | None = None,
+        max_length: int = 256,
+        device: str = "cpu",
     ) -> None:
         root = str(checkpoint_path)
         from transformers import AutoModel, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(root, revision=revision, local_files_only=True)
-        self.model = AutoModel.from_pretrained(root, revision=revision, local_files_only=True).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            root, revision=revision, local_files_only=True
+        )
+        self.model = AutoModel.from_pretrained(
+            root, revision=revision, local_files_only=True
+        ).to(device)
         self.model.requires_grad_(False).eval()
         self.output_dim = self.model.config.hidden_size
         self.device = device
@@ -82,7 +48,10 @@ class FrozenTextEncoder:
         )["input_ids"]
         self.truncated_items += sum(len(tokens) > self.max_length for tokens in lengths)
         tokens = self.tokenizer(
-            list(texts), padding=True, truncation=True, max_length=self.max_length,
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
             return_tensors="pt",
         ).to(self.device)
         output = self.model(**tokens).last_hidden_state
@@ -95,16 +64,26 @@ class FrozenTokenTextEncoder(FrozenTextEncoder):
     """Frozen sequence states for the unchanged CrossTrans attention blocks."""
 
     def __init__(
-        self, checkpoint_path: str | Path, revision: str | None = None,
-        max_length: int = 256, device: str = "cpu",
+        self,
+        checkpoint_path: str | Path,
+        revision: str | None = None,
+        max_length: int = 256,
+        device: str = "cpu",
     ) -> None:
         super().__init__(checkpoint_path, revision, max_length, device)
-        self.fingerprint = f"text:{checkpoint_path}:{revision}:token-states:{max_length}"
+        self.fingerprint = (
+            f"text:{checkpoint_path}:{revision}:token-states:{max_length}"
+        )
 
     @torch.no_grad()
-    def encode_tokens(self, texts: Sequence[str]) -> tuple[Tensor, Tensor]:
+    def encode_tokens(
+        self, texts: Sequence[str], max_length: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
         tokens = self.tokenizer(
-            list(texts), padding=True, truncation=True, max_length=self.max_length,
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=max_length or self.max_length,
             return_tensors="pt",
         ).to(self.device)
         output = self.model(**tokens).last_hidden_state
@@ -116,14 +95,20 @@ class FrozenTokenTextEncoder(FrozenTextEncoder):
 
 class FrozenVisionEncoder:
     def __init__(
-        self, checkpoint_path: str | Path, revision: str | None = None,
+        self,
+        checkpoint_path: str | Path,
+        revision: str | None = None,
         device: str = "cpu",
     ) -> None:
         root = str(checkpoint_path)
         from transformers import AutoImageProcessor, CLIPVisionModel
 
-        self.processor = AutoImageProcessor.from_pretrained(root, revision=revision, local_files_only=True)
-        self.model = CLIPVisionModel.from_pretrained(root, revision=revision, local_files_only=True).to(device)
+        self.processor = AutoImageProcessor.from_pretrained(
+            root, revision=revision, local_files_only=True
+        )
+        self.model = CLIPVisionModel.from_pretrained(
+            root, revision=revision, local_files_only=True
+        ).to(device)
         self.model.requires_grad_(False).eval()
         self.output_dim = self.model.config.hidden_size
         self.device = device
@@ -147,17 +132,23 @@ class FrozenCLIPImageEncoder:
     """Normalized projected CLIP features, as used by CrossTransVFC's image path."""
 
     def __init__(
-        self, checkpoint_path: str | Path, revision: str | None = None,
+        self,
+        checkpoint_path: str | Path,
+        revision: str | None = None,
         device: str = "cpu",
     ) -> None:
         from transformers import AutoImageProcessor, CLIPVisionModelWithProjection
 
         root = str(checkpoint_path)
         self.processor = AutoImageProcessor.from_pretrained(
-            root, revision=revision, local_files_only=True,
+            root,
+            revision=revision,
+            local_files_only=True,
         )
         self.model = CLIPVisionModelWithProjection.from_pretrained(
-            root, revision=revision, local_files_only=True,
+            root,
+            revision=revision,
+            local_files_only=True,
         ).to(device)
         self.model.requires_grad_(False).eval()
         self.output_dim = self.model.config.projection_dim

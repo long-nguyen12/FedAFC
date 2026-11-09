@@ -1,8 +1,9 @@
 kind: federated
-use_table_evidence: false
+use_table_evidence: true
 seed: 42
-device: cpu
+device: cuda
 output_root: outputs
+feature_cache_dir: null     # thư mục cache feature frozen; null = không cache
 
 datasets:
   - id: mocheg
@@ -36,14 +37,17 @@ model:
 
 max_text_evidence: 4
 max_image_evidence: 2
+max_table_evidence: 2
+max_table_tokens: 1024
 
 training:
-  batch_size: 2
-  epochs: 5
+  batch_size: 8
+  epochs: 50
   learning_rate: 0.0001
   mode: shared_private
   private_weight: 0.5
-  patience: 3
+  logit_adjustment: 1.0     # A6: tau; 0.0 disables
+  patience: 5
 
 evaluation:
   primary_cohort: all_eligible

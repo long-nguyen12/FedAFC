@@ -7,7 +7,8 @@ import torch
 from torch import Tensor
 
 GROUPS = frozenset({
-    "claim_text", "text_evidence", "image_evidence", "table_evidence", "fusion", "global_head",
+    "claim_text", "text_evidence", "image_evidence", "table_evidence",
+    "joint_fusion", "fusion", "global_head",
 })
 
 

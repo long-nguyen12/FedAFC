@@ -18,8 +18,6 @@ class MaskedFusion(nn.Module):
         values = [claim, text, image]
         presence = [torch.ones_like(text_present), text_present, image_present]
         if self.include_table:
-            if table is None or table_present is None:
-                raise ValueError("Table-enabled fusion requires table values and presence mask")
             values.append(table)
             presence.append(table_present)
         elif table_present is not None and table_present.any():

@@ -50,14 +50,20 @@ class ClientState:
             raise ValueError("epochs must be a positive integer")
         local_batches = list(batches)
         train_kwargs.setdefault("prox_reference", self._anchor)
+        progress_desc = train_kwargs.pop("progress_desc", "Train")
         totals: dict[str, Any] = {
             "loss": 0.0,
             "sample_count": 0,
             "optimizer_steps": 0,
             "group_counts": dict.fromkeys(set(self.model.parameter_groups().values()), 0),
         }
-        for _ in range(epochs):
-            stats = train_epoch(self.model, local_batches, self.optimizer, **train_kwargs)
+        for epoch in range(epochs):
+            stats = train_epoch(
+                self.model, local_batches, self.optimizer, **train_kwargs,
+                progress_desc=(
+                    f"{progress_desc} | {self.client_id} | Epoch {epoch + 1}/{epochs}"
+                ),
+            )
             for key in ("sample_count", "optimizer_steps"):
                 totals[key] += stats[key]
             totals["loss"] += stats["loss"]
