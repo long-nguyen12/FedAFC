@@ -3,13 +3,13 @@ import cv2
 import glob
 from tqdm import tqdm, trange
 
-DATA_PATH = "C:\\Users\\hnguyen\\Documents\\PhD\\Code\\FedFC\\datasets\\mocheg"
+DATA_PATH = "/home/jovyan/work/FedAFC/datasets/mocheg"
 
 
 def read_text_corpus(path):
-    train = path + "\\train\\Corpus2.csv"
-    dev = path + "\\val\\Corpus2.csv"
-    test = path + "\\test\\Corpus2.csv"
+    train = path + "/train/Corpus2.csv"
+    dev = path + "/val/Corpus2.csv"
+    test = path + "/test/Corpus2.csv"
 
     train_data = pd.read_csv(train, low_memory=False)
     val_data = pd.read_csv(dev, low_memory=False)
@@ -62,9 +62,9 @@ def read_image_path_only(path):
 
 
 def read_images_corpus(path):
-    train = path + "\\train\\images"
-    dev = path + "\\val\\images"
-    test = path + "\\test\\images"
+    train = path + "/train/images"
+    dev = path + "/val/images"
+    test = path + "/test/images"
 
     train_images = read_image_path_only(train)
     dev_images = read_image_path_only(dev)

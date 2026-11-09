@@ -4,7 +4,7 @@ import os
 import pandas as pd
 from tqdm import tqdm
 
-DATA_PATH = "C:\\Users\\hnguyen\\Documents\\PhD\\Code\\FedFC\\datasets\\mmcv"
+DATA_PATH = "/home/jovyan/work/FedAFC/datasets/mmcv"
 
 
 def read_text_corpus(path, subset="all"):
