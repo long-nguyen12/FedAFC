@@ -1,6 +1,7 @@
+import os
+
 import pandas as pd
 import cv2
-import glob
 from tqdm import tqdm, trange
 
 DATA_PATH = "/home/jovyan/work/FedAFC/datasets/mocheg"
@@ -18,21 +19,36 @@ def read_text_corpus(path):
     return (train_data, val_data, test_data)
 
 
+IMAGE_EXTENSIONS = ("jpg", "jpeg", "png")
+
+
+def image_files(path):
+    """Image paths in the order glob gives on Windows, on any OS.
+
+    Per extension (jpg, then jpeg, then png), matched case-insensitively and
+    sorted case-insensitively, so Linux reads the same files in the same order.
+    """
+    names = os.listdir(path)
+    return [
+        os.path.join(path, name)
+        for extension in IMAGE_EXTENSIONS
+        for name in sorted(
+            (n for n in names if os.path.splitext(n)[1].lower() == "." + extension),
+            key=str.lower,
+        )
+    ]
+
+
 def read_image(path):
     # imdir = 'path/to/files/'
-    ext = ["jpg", "jpeg", "png"]
-
-    files = []
+    files = image_files(path)
     images = []
     names = []
     claim = []
-    for e in ext:
-        for img in glob.glob(path + "/*." + e):
-            files.append(img)
 
     for f in files:
-        names.append(f.split("\\")[-1])
-        claim.append(int(f.split("\\")[-1].split("-")[0]))
+        names.append(os.path.basename(f))
+        claim.append(int(os.path.basename(f).split("-")[0]))
         images.append(cv2.imread(f))
 
     # images = [cv2.imread(file) for file in files]
@@ -41,19 +57,14 @@ def read_image(path):
 
 
 def read_image_path_only(path):
-    ext = ["jpg", "jpeg", "png"]
-
-    files = []
+    files = image_files(path)
     images = []
     names = []
     claim = []
-    for e in ext:
-        for img in glob.glob(path + "/*." + e):
-            files.append(img)
 
     for f in files:
-        names.append(f.split("\\")[-1])
-        claim.append(int(f.split("\\")[-1].split("-")[0]))
+        names.append(os.path.basename(f))
+        claim.append(int(os.path.basename(f).split("-")[0]))
         images.append(f)
 
     # images = [cv2.imread(file) for file in files]
