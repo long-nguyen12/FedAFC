@@ -16,12 +16,14 @@ Row = dict[str, Tensor]
 class CrossTransCollator:
     def __init__(
         self, claim_encoder: Any, evidence_encoder: Any, vision_encoder: Any,
-        original_label_mapping: dict[str, int], max_text_evidence: int = 4,
-        max_image_evidence: int = 2, max_table_evidence: int | None = None,
+        original_label_mapping: dict[str, int], max_text_evidence: int | None = 4,
+        max_image_evidence: int | None = 2, max_table_evidence: int | None = None,
         max_table_tokens: int | None = None, cache_dir: str | Path | None = None,
     ) -> None:
-        if min(max_text_evidence, max_image_evidence) < 1:
-            raise ValueError("Evidence budgets must be positive")
+        # None means every supplied text piece / image is used.
+        if any(budget is not None and budget < 1
+               for budget in (max_text_evidence, max_image_evidence)):
+            raise ValueError("Evidence budgets must be positive, or None to use every item")
         if (max_table_evidence is None) != (max_table_tokens is None) or (
             max_table_evidence is not None and min(max_table_evidence, max_table_tokens) < 1
         ):
@@ -71,10 +73,12 @@ class CrossTransCollator:
             row["claim"] = states[mask]
         separator = self.evidence_encoder.tokenizer.sep_token or "[SEP]"
         texts = [self._items(r, "text") for r in records]
-        self._encode_sequences(rows, "text", {
-            index: f" {separator} ".join(item.text for item in items[:self.max_text])
-            for index, items in enumerate(texts) if items
-        })
+        untruncated = self.evidence_encoder.max_length is None
+        self._encode_sequences(rows, "text", [
+            (index, sequence)
+            for index, (record, items) in enumerate(zip(records, texts, strict=True)) if items
+            for sequence in self._text_sequences(record, items[:self.max_text], separator)
+        ], max_length=self._text_token_limit() if untruncated else None)
         for row, record in zip(rows, records, strict=True):
             selected = self._items(record, "image")[:self.max_image]
             if selected:
@@ -82,23 +86,69 @@ class CrossTransCollator:
         if self.max_table is not None:
             # Tables are a separate token stream from the same frozen evidence encoder.
             tables = [self._items(r, "table") for r in records]
-            self._encode_sequences(rows, "table", {
-                index: f" {separator} ".join(
+            self._encode_sequences(rows, "table", [
+                (index, f" {separator} ".join(
                     serialize_table_rows(item.table) for item in items[:self.max_table]
-                )
+                ))
                 for index, items in enumerate(tables) if items
-            }, max_length=self.max_table_tokens)
+            ], max_length=self.max_table_tokens)
         return rows
 
+    def _text_token_limit(self) -> int:
+        """Longest sequence the evidence encoder accepts (Longformer: 4,096 tokens)."""
+        config = self.evidence_encoder.model.config
+        return min(self.evidence_encoder.tokenizer.model_max_length,
+                   config.max_position_embeddings - 2)
+
+    def _text_sequences(
+        self, record: VerificationRecord, items: list[Any], separator: str,
+    ) -> list[str]:
+        """Join text pieces with the separator token.
+
+        With a fixed ``encoders.evidence.max_length`` this is one sequence that the
+        encoder truncates (previous behaviour). With ``max_length: null`` nothing is
+        cut: pieces that no longer fit the encoder limit start a new sequence at a
+        piece boundary, and a single piece longer than the limit raises.
+        """
+        joiner = f" {separator} "
+        texts = [item.text for item in items]
+        if self.evidence_encoder.max_length is not None:
+            return [joiner.join(texts)]
+        tokenizer, limit = self.evidence_encoder.tokenizer, self._text_token_limit()
+
+        def fits(text: str) -> bool:
+            return len(tokenizer(text, truncation=False)["input_ids"]) <= limit
+
+        if fits(joiner.join(texts)):
+            return [joiner.join(texts)]
+        sequences, current = [], []
+        for text in texts:
+            if current and not fits(joiner.join([*current, text])):
+                sequences.append(joiner.join(current))
+                current = []
+            current.append(text)
+        sequences.append(joiner.join(current))
+        if not all(fits(sequence) for sequence in sequences):
+            raise ValueError(
+                f"A text evidence piece of {record.record_id} exceeds the {limit}-token "
+                "encoder limit; it would have to be truncated"
+            )
+        return sequences
+
     def _encode_sequences(
-        self, rows: list[Row], key: str, contents: dict[int, str], max_length: int | None = None,
+        self, rows: list[Row], key: str, contents: list[tuple[int, str]],
+        max_length: int | None = None,
     ) -> None:
+        """Encode (row, text) pairs; a row with several sequences keeps their states in order."""
         if not contents:
             return
         options = {} if max_length is None else {"max_length": max_length}
-        features, masks = self.evidence_encoder.encode_tokens(list(contents.values()), **options)
-        for index, states, mask in zip(contents, features, masks, strict=True):
-            rows[index][key] = states[mask]
+        features, masks = self.evidence_encoder.encode_tokens(
+            [text for _, text in contents], **options,
+        )
+        for (index, _), states, mask in zip(contents, features, masks, strict=True):
+            part = states[mask]
+            rows[index][key] = torch.cat([rows[index][key], part]) if key in rows[index] else part
 
     def _cache_path(self, record: VerificationRecord) -> Path:
         parts = (record.dataset_id, record.split, record.record_id)
@@ -133,7 +183,7 @@ class CrossTransCollator:
         expected = {"claim"} | {kind for kind in ("text", "image") if self._items(record, kind)}
         if self.max_table is not None and self._items(record, "table"):
             expected.add("table")
-        images = min(len(self._items(record, "image")), self.max_image)
+        images = len(self._items(record, "image")[:self.max_image])
         if set(row) != expected or (images and row["image"].shape[0] != images):
             raise ValueError(
                 f"Cached features of {record.record_id} do not match this configuration; "
@@ -171,8 +221,9 @@ class CrossTransCollator:
             "dataset_ids": [r.dataset_id for r in records],
             "record_ids": [r.record_id for r in records],
             "truncation": {
-                "text_evidence": sum(max(0, n - self.max_text) for n in counts["text"]),
-                "image_evidence": sum(max(0, n - self.max_image) for n in counts["image"]),
+                # A None budget keeps every item, so nothing is dropped.
+                "text_evidence": sum(max(0, n - (self.max_text or n)) for n in counts["text"]),
+                "image_evidence": sum(max(0, n - (self.max_image or n)) for n in counts["image"]),
             },
         }
         if self.max_table is not None:

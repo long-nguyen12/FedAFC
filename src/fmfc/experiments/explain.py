@@ -33,7 +33,7 @@ def explain_record(
     counts = {"text": 0, "image": 0}
     budgets = {"text": collator.max_text, "image": collator.max_image}
     for item in record.evidence:
-        if counts[item.kind] < budgets[item.kind]:
+        if budgets[item.kind] is None or counts[item.kind] < budgets[item.kind]:
             selected.append(item)
             counts[item.kind] += 1
     if not selected:
@@ -61,6 +61,8 @@ def explain_record(
         return cache[keep]
 
     def truncated(encoder: Any, text: str) -> bool:
+        if encoder.max_length is None:  # the collator splits instead of truncating
+            return False
         tokens = encoder.tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
         return len(tokens) > encoder.max_length
 

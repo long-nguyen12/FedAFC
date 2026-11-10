@@ -24,7 +24,7 @@ encoders:
   evidence:
     checkpoint_path: allenai/longformer-base-4096
     revision: null
-    max_length: 512
+    max_length: null          # không cắt; claim dài quá 4.096 token được tách theo ranh giới đoạn
   vision:
     checkpoint_path: openai/clip-vit-base-patch32
     revision: null
@@ -35,8 +35,8 @@ model:
   dropout: 0.1
   cls_dropout: 0.4
 
-max_text_evidence: 4
-max_image_evidence: 2
+max_text_evidence: null     # null = dùng mọi đoạn text evidence
+max_image_evidence: null    # null = dùng mọi ảnh evidence
 max_table_evidence: 2
 max_table_tokens: 1024
 
