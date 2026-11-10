@@ -29,7 +29,9 @@ from fmfc.training.local import make_optimizer, presence_log_priors, train_epoch
 
 
 def _json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str, Any]:
@@ -39,7 +41,9 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
     cfg.setdefault("device", "cpu")
     cfg.setdefault("output_root", "outputs")
     cfg.setdefault("ablation", "all")
-    cfg.setdefault("use_table_evidence", cfg.get("model", {}).get("table_dim") is not None)
+    cfg.setdefault(
+        "use_table_evidence", cfg.get("model", {}).get("table_dim") is not None
+    )
     for section, defaults in {
         "model": {"hidden_dim": 256},
         "training": {
@@ -71,16 +75,18 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
         },
     }.items():
         cfg[section] = {**defaults, **cfg.get(section, {})}
-    limit = cfg.get("limit")
-            
-    cfg["algorithm"] = cfg["kind"] if cfg["kind"] != "federated" else cfg["fl"]["algorithm"]
+    if cfg.get("limit") is not None:
+        raise ValueError("limit was removed: runs always use the full train/dev splits")
+    cfg["algorithm"] = (
+        cfg["kind"] if cfg["kind"] != "federated" else cfg["fl"]["algorithm"]
+    )
     return cfg
 
 
 def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
     ratios = policy.get("ratios", [])
     seed = policy.get("seed")
-    
+
     claims = sorted(claims, key=lambda row: row[4])
     parent = list(range(len(claims)))
 
@@ -93,11 +99,16 @@ def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
     seen = {}
     for index, (claim, texts, images, _, _, tables) in enumerate(claims):
         keys = [("claim", " ".join(claim.casefold().split()))]
-        keys.extend(("text", " ".join(text.casefold().split())) for text in texts
-                    if isinstance(text, str) and text.strip())
+        keys.extend(
+            ("text", " ".join(text.casefold().split()))
+            for text in texts
+            if isinstance(text, str) and text.strip()
+        )
         keys.extend(("image", path.replace("\\", "/").casefold()) for path in images)
-        keys.extend(("table", json.dumps(table, sort_keys=True, ensure_ascii=False))
-                    for table in tables)
+        keys.extend(
+            ("table", json.dumps(table, sort_keys=True, ensure_ascii=False))
+            for table in tables
+        )
         for key in keys:
             if key in seen:
                 parent[root(index)] = root(seen[key])
@@ -114,14 +125,18 @@ def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
     for group in ordered:
         target = max(range(3), key=lambda i: targets[i] - len(parts[i]))
         parts[target].extend(group)
-    return {name: sorted(rows, key=lambda row: row[4])
-            for name, rows in zip(("train", "dev", "test"), parts, strict=True)}
+    return {
+        name: sorted(rows, key=lambda row: row[4])
+        for name, rows in zip(("train", "dev", "test"), parts, strict=True)
+    }
 
 
 def _real_batches(
-    cfg: dict[str, Any], split: str, cache: dict | None = None,
+    cfg: dict[str, Any],
+    split: str,
+    cache: dict | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Adapt the supplied tuple loaders; limit records before frozen encoding."""
+    """Adapt the supplied tuple loaders; frozen encoding is deferred to each batch."""
     specs = cfg.get("datasets", [])
     if cfg["kind"] == "local":
         selected = cfg.get("local_client", specs[0]["id"])
@@ -152,13 +167,19 @@ def _real_batches(
             if dataset == "mocheg":
                 from fmfc.data.mocheg import get_dataset
 
-                parts = dict(zip(("train", "dev", "test"), get_dataset(spec["path"]), strict=True))
+                parts = dict(
+                    zip(
+                        ("train", "dev", "test"), get_dataset(spec["path"]), strict=True
+                    )
+                )
                 metadata = {"split_protocol": "supplied train/val/test"}
             else:
                 from fmfc.data.mmcv import get_dataset
 
                 claims = get_dataset(
-                    spec["path"], subset=spec.get("subset", "all"), mmqa_path=spec.get("mmqa_path")
+                    spec["path"],
+                    subset=spec.get("subset", "all"),
+                    mmqa_path=spec.get("mmqa_path"),
                 )
                 parts = _mmcv_splits(claims, spec["split"])
                 metadata = {
@@ -175,15 +196,19 @@ def _real_batches(
                     f"{dataset} has table evidence; set use_table_evidence: true "
                     "(tables are never silently discarded)"
                 )
-            vocabulary = sorted({str(row[3]) for rows in parts.values() for row in rows})
+            vocabulary = sorted(
+                {str(row[3]) for rows in parts.values() for row in rows}
+            )
             label_map = {label: index for index, label in enumerate(vocabulary)}
             cache[dataset] = parts, label_map, metadata
         parts, label_map, metadata = cache[dataset]
         rows = sorted(parts[split], key=lambda row: row[4])
-        if cfg.get("limit") is not None and split in {"train", "dev"}:
-            rows = rows[:cfg["limit"]]
-        global_map = {"supported": "SUPPORT", "refuted": "REFUTE",
-                      "SUPPORT": "SUPPORT", "REFUTE": "REFUTE"}
+        global_map = {
+            "supported": "SUPPORT",
+            "refuted": "REFUTE",
+            "SUPPORT": "SUPPORT",
+            "REFUTE": "REFUTE",
+        }
         records = []
         for row in rows:
             claim, texts, images, label, claim_id = row[:5]
@@ -195,17 +220,31 @@ def _real_batches(
                     # Pandas represents missing text as NaN; never encode it as "nan".
                     if isinstance(value, str) and value.strip():
                         content = {"text" if kind == "text" else "image_path": value}
-                        evidence.append(EvidenceItem(
-                            f"{record_id}:{kind}:{index}", kind, record_id, **content
-                        ))
+                        evidence.append(
+                            EvidenceItem(
+                                f"{record_id}:{kind}:{index}",
+                                kind,
+                                record_id,
+                                **content,
+                            )
+                        )
             evidence.extend(
-                EvidenceItem(f"{record_id}:table:{index}", "table", record_id, table=table)
+                EvidenceItem(
+                    f"{record_id}:table:{index}", "table", record_id, table=table
+                )
                 for index, table in enumerate(tables)
             )
-            records.append(VerificationRecord(
-                record_id=record_id, dataset_id=dataset, split=split, claim_text=claim,
-                evidence=tuple(evidence), original_label=str(label), global_label=global_map.get(label),
-            ))
+            records.append(
+                VerificationRecord(
+                    record_id=record_id,
+                    dataset_id=dataset,
+                    split=split,
+                    claim_text=claim,
+                    evidence=tuple(evidence),
+                    original_label=str(label),
+                    global_label=global_map.get(label),
+                )
+            )
         size = cfg["training"]["batch_size"]
         budgets = {
             "max_text_evidence": cfg.get("max_text_evidence", 4),
@@ -215,19 +254,28 @@ def _real_batches(
             budgets["max_table_evidence"] = cfg.get("max_table_evidence", 2)
             budgets["max_table_tokens"] = cfg.get("max_table_tokens", 1024)
         collator = CrossTransCollator(
-            text_encoder, cache["evidence_encoder"], vision_encoder, label_map, **budgets,
+            text_encoder,
+            cache["evidence_encoder"],
+            vision_encoder,
+            label_map,
+            **budgets,
             cache_dir=cfg.get("feature_cache_dir"),
         )
         clients[dataset] = [
-            collator.defer(records[start:start + size], cfg["ablation"], cfg["seed"])
+            collator.defer(records[start : start + size], cfg["ablation"], cfg["seed"])
             for start in range(0, len(records), size)
         ]
         labels[dataset] = label_map
         sources[dataset] = {
-            "path": str(spec["path"]), **metadata,
+            "path": str(spec["path"]),
+            **metadata,
             "split_sizes": {name: len(part) for name, part in parts.items()},
-            "encoded_samples": len(records), "split": split,
-            "encoders": {"text": text_encoder.fingerprint, "vision": vision_encoder.fingerprint},
+            "encoded_samples": len(records),
+            "split": split,
+            "encoders": {
+                "text": text_encoder.fingerprint,
+                "vision": vision_encoder.fingerprint,
+            },
         }
     return clients, labels, sources
 
@@ -243,43 +291,25 @@ def _reshuffled_batches(batches: list[dict], size: int) -> list[dict]:
     records = [record for batch in batches for record in batch["_records"]]
     random.shuffle(records)
     return [
-        first["_collator"].defer(records[start:start + size], first["_ablation"], first["_seed"])
+        first["_collator"].defer(
+            records[start : start + size], first["_ablation"], first["_seed"]
+        )
         for start in range(0, len(records), size)
     ]
 
 
-def _data(cfg: dict[str, Any], split: str, real_cache: dict | None = None) -> tuple[dict, dict, dict]:
-    data, labels, sources = _real_batches(cfg, split, real_cache)
-    limit = cfg.get("limit")
-    if limit is None or split not in {"train", "dev"}:
-        return data, labels, sources
-    limited = {}
-    for client, batches in data.items():
-        limited[client] = []
-        remaining = limit
-        for batch in batches:
-            if remaining == 0:
-                break
-            count = len(batch["global_labels"])
-            if count > remaining:
-                batch = {
-                    key: value[:remaining] if (
-                        isinstance(value, torch.Tensor) and value.ndim > 0 and len(value) == count
-                        or isinstance(value, (list, tuple)) and len(value) == count
-                    ) else value
-                    for key, value in batch.items()
-                }
-            limited[client].append(batch)
-            remaining -= min(count, remaining)
-    return limited, labels, sources
-
-
 def _metrics(
-    models: dict[str, CrossTransVerifier], data: dict, cfg: dict, *, progress_desc: str = "Val",
+    models: dict[str, CrossTransVerifier],
+    data: dict,
+    cfg: dict,
+    *,
+    progress_desc: str = "Val",
 ) -> dict[str, Any]:
     reports = {
         client: evaluate(
-            models[client], batches, device=cfg["device"],
+            models[client],
+            batches,
+            device=cfg["device"],
             progress_desc=f"{progress_desc} | {client}",
         )
         for client, batches in data.items()
@@ -303,7 +333,8 @@ def _metrics(
         "primary_cohort": cfg["evaluation"]["primary_cohort"],
         "real_client_count": len(cfg["datasets"]),
         "pseudo_client_count": cfg.get("pseudo_clients", 1),
-        "evidence_sufficiency_unknown_after_ablation": cfg["ablation"] not in {"all", "both"},
+        "evidence_sufficiency_unknown_after_ablation": cfg["ablation"]
+        not in {"all", "both"},
         "original_head_trained": cfg["training"]["mode"] == "shared_private"
         and cfg["training"]["private_weight"] > 0,
     }
@@ -316,8 +347,8 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     torch.set_num_threads(1)
     started = time.perf_counter()
     real_cache: dict = {}
-    train, labels, _ = _data(cfg, "train", real_cache)
-    dev, dev_labels, _ = _data(cfg, "dev", real_cache)
+    train, labels, _ = _real_batches(cfg, "train", real_cache)
+    dev, dev_labels, _ = _real_batches(cfg, "dev", real_cache)
     real_cache.clear()
     if labels != dev_labels:
         raise ValueError("Training and dev label vocabularies differ")
@@ -340,11 +371,15 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     models = {client: copy.deepcopy(initial) for client in train}
     if cfg["kind"] == "federated":
         for client, model in models.items():
-            local_datasets = {name for batch in train[client] for name in batch["dataset_ids"]}
+            local_datasets = {
+                name for batch in train[client] for name in batch["dataset_ids"]
+            }
             for name in list(model.private_heads):
                 if name not in local_datasets:
                     del model.private_heads[name]
-    optimizer_args = {key: cfg["training"][key] for key in ("learning_rate", "weight_decay")}
+    optimizer_args = {
+        key: cfg["training"][key] for key in ("learning_rate", "weight_decay")
+    }
     clients = {
         client: ClientState(client, model, make_optimizer(model, **optimizer_args))
         for client, model in models.items()
@@ -353,7 +388,9 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         for client in models:
             models[client] = initial
         clients = {
-            "pooled": ClientState("pooled", initial, make_optimizer(initial, **optimizer_args))
+            "pooled": ClientState(
+                "pooled", initial, make_optimizer(initial, **optimizer_args)
+            )
         }
     fl = cfg["fl"]
     server = ServerState(
@@ -362,11 +399,14 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         algorithm=fl["algorithm"],
         weighting=fl["weighting"],
         learning_rate=fl["server_learning_rate"],
-        allow_experimental_conflict=fl.get("allow_experimental_conflict", False),
-        conflict_beta=fl.get("conflict_beta", 0.5),
     )
     history, step, best, stale = [], 0, -1.0, 0
-    run_id = cfg.get("run_id") or datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    # run_id = cfg.get("run_id") or datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = (
+        f'{kind}_{datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")}'
+        if cfg.get("run_id") is None
+        else cfg["run_id"]
+    )
     if Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("run_id must be a single directory name")
     folder = Path(cfg["output_root"]) / run_id
@@ -374,17 +414,30 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     target = fl["rounds"] if cfg["kind"] == "federated" else cfg["training"]["epochs"]
     train_kwargs = {
         key: cfg["training"][key]
-        for key in ("mode", "global_weight", "private_weight", "max_grad_norm", "warmup_steps",
-                    "logit_adjustment")
+        for key in (
+            "mode",
+            "global_weight",
+            "private_weight",
+            "max_grad_norm",
+            "warmup_steps",
+            "logit_adjustment",
+        )
     }
     train_kwargs["device"] = cfg["device"]
-    batch_size, reshuffle = cfg["training"]["batch_size"], cfg["training"]["reshuffle_records"]
+    batch_size, reshuffle = (
+        cfg["training"]["batch_size"],
+        cfg["training"]["reshuffle_records"],
+    )
     priors = {}
     if cfg["training"]["logit_adjustment"]:
         if cfg["ablation"] not in {"all", "both"}:
-            raise ValueError("Logit-adjustment priors assume unablated training evidence")
+            raise ValueError(
+                "Logit-adjustment priors assume unablated training evidence"
+            )
         # Each client's own train records; keys carry the dataset, so pooling is safe.
-        priors = {client: presence_log_priors(batches) for client, batches in train.items()}
+        priors = {
+            client: presence_log_priors(batches) for client, batches in train.items()
+        }
     selected_state = None
     step_label = "Round" if cfg["kind"] == "federated" else "Epoch"
     while step < target:
@@ -394,7 +447,8 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             for client_id, client in clients.items():
                 client.broadcast(server.shared_state())
                 batches = (
-                    _reshuffled_batches(train[client_id], batch_size) if reshuffle
+                    _reshuffled_batches(train[client_id], batch_size)
+                    if reshuffle
                     else random.sample(train[client_id], len(train[client_id]))
                 )
                 update = client.train(
@@ -415,20 +469,30 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
                 client.broadcast(shared)
         else:
             pooled = [
-                batch for batches in train.values()
-                for batch in (_reshuffled_batches(batches, batch_size) if reshuffle else batches)
+                batch
+                for batches in train.values()
+                for batch in (
+                    _reshuffled_batches(batches, batch_size) if reshuffle else batches
+                )
             ]
             stats["pooled"] = train_epoch(
                 initial,
                 random.sample(pooled, len(pooled)),
                 clients["pooled"].optimizer,
                 **train_kwargs,
-                log_priors={key: value for part in priors.values() for key, value in part.items()},
+                log_priors={
+                    key: value
+                    for part in priors.values()
+                    for key, value in part.items()
+                },
                 progress_desc=f"Train | {cfg['kind']} | Epoch {step + 1}/{target}",
             )
         step += 1
         metrics = _metrics(
-            models, dev, cfg, progress_desc=f"Val | {step_label} {step}/{target}",
+            models,
+            dev,
+            cfg,
+            progress_desc=f"Val | {step_label} {step}/{target}",
         )
         score = metrics["mean_client_binary_macro_f1"]
         improved = score > best
@@ -438,14 +502,18 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
                 "step": step,
                 "mean_client_binary_macro_f1": score,
                 "worst_client_binary_macro_f1": metrics["worst_client_binary_macro_f1"],
-                "optimizer_steps": json.dumps({k: v["optimizer_steps"] for k, v in stats.items()}),
+                "optimizer_steps": json.dumps(
+                    {k: v["optimizer_steps"] for k, v in stats.items()}
+                ),
             }
         )
         if improved:
             selected_state = {
                 "step": step,
                 "server": server.state_dict(),
-                "clients": {key: client.state_dict() for key, client in clients.items()},
+                "clients": {
+                    key: client.state_dict() for key, client in clients.items()
+                },
             }
         patience = cfg["training"]["patience"]
         if patience and stale >= patience:
@@ -463,7 +531,9 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         folder / "best_model.pt",
     )
     metrics = _metrics(
-        models, dev, cfg,
+        models,
+        dev,
+        cfg,
         progress_desc=f"Val | Selected {step_label.lower()} {selected_state['step']}",
     )
     metrics["selected_step"] = selected_state["step"]
@@ -510,11 +580,16 @@ def freeze_selection(run_dir: str | Path) -> None:
 
 
 def evaluate_run(
-    run_dir: str | Path, split: str = "dev", final: bool = False, ablation: str | None = None
+    run_dir: str | Path,
+    split: str = "dev",
+    final: bool = False,
+    ablation: str | None = None,
 ) -> dict:
     folder = Path(run_dir)
-    if (not (folder / "config_resolved.yaml").is_file()
-            or not (folder / "checkpoints" / "selected.pt").is_file()):
+    if (
+        not (folder / "config_resolved.yaml").is_file()
+        or not (folder / "checkpoints" / "selected.pt").is_file()
+    ):
         raise ValueError(
             "Re-evaluation requires config and checkpoint files from an older run; "
             "new runs save results and best model weights only"
@@ -524,7 +599,9 @@ def evaluate_run(
         raise ValueError("Evaluation split must be dev or test")
     if split == "test":
         if ablation:
-            raise ValueError("Choose and preregister test ablations before final evaluation")
+            raise ValueError(
+                "Choose and preregister test ablations before final evaluation"
+            )
         frozen = folder / "selection_frozen.json"
         if not final or not frozen.is_file():
             raise ValueError("Test is locked; freeze selection and pass --final")
@@ -535,7 +612,7 @@ def evaluate_run(
     state = torch.load(
         folder / "checkpoints" / "selected.pt", map_location="cpu", weights_only=True
     )
-    data, labels, _ = _data(cfg, split)
+    data, labels, _ = _real_batches(cfg, split)
     if cfg["kind"] == "local":
         selected = cfg.get("local_client", next(iter(data)))
         data = {selected: data[selected]}
@@ -545,7 +622,9 @@ def evaluate_run(
         local_labels = {
             key: len(value)
             for key, value in labels.items()
-            if any(param.startswith(f"private_heads.{key}.") for param in payload["model"])
+            if any(
+                param.startswith(f"private_heads.{key}.") for param in payload["model"]
+            )
         }
         model = CrossTransVerifier(**cfg["model"], private_labels=local_labels)
         model.load_state_dict(payload["model"])
@@ -554,15 +633,28 @@ def evaluate_run(
         models[name] = model
         if ablation:
             data[name] = [
-                {**batch, "_ablation": ablation} if "_collator" in batch
-                else ablate_batch(batch, ablation, cfg["seed"])[0]
+                (
+                    {**batch, "_ablation": ablation}
+                    if "_collator" in batch
+                    else ablate_batch(batch, ablation, cfg["seed"])[0]
+                )
                 for batch in data[name]
             ]
-    metrics = _metrics(models, data, cfg, progress_desc="Test" if split == "test" else "Val")
+    metrics = _metrics(
+        models, data, cfg, progress_desc="Test" if split == "test" else "Val"
+    )
     metrics["evaluation_split"] = split
     metrics["ablation"] = ablation or cfg["ablation"]
-    metrics["robustness_only"] = metrics["ablation"] in {"shuffle_image", "drop_image", "drop_table"}
-    metrics["evidence_sufficiency_unknown_after_ablation"] = metrics["ablation"] not in {"all", "both"}
-    target = f"metrics_{split}.json" if not ablation else f"ablation_{split}_{ablation}.json"
+    metrics["robustness_only"] = metrics["ablation"] in {
+        "shuffle_image",
+        "drop_image",
+        "drop_table",
+    }
+    metrics["evidence_sufficiency_unknown_after_ablation"] = metrics[
+        "ablation"
+    ] not in {"all", "both"}
+    target = (
+        f"metrics_{split}.json" if not ablation else f"ablation_{split}_{ablation}.json"
+    )
     _json(folder / target, metrics)
     return metrics

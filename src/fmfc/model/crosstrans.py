@@ -126,8 +126,6 @@ class CrossTransVerifier(Verifier):
         if self.table_dim is None and table_mask is not None and table_mask.any():
             raise ValueError("Table evidence requires CrossTrans built with table_dim")
         claim = batch["claim_features"]
-        if claim.ndim == 2:  # Synthetic feature fixtures have one claim token.
-            claim = claim.unsqueeze(1)
         claim_mask = batch.get("claim_mask")
         if claim_mask is None:
             claim_mask = torch.ones(claim.shape[:2], dtype=torch.bool, device=claim.device)

@@ -25,11 +25,6 @@ def main(argv: list[str] | None = None) -> int:
     for command in ("train-local", "train-centralized", "train-federated", "matrix"):
         command_parser = commands.add_parser(command)
         command_parser.add_argument("--config", type=Path, required=True)
-        if command != "matrix":
-            command_parser.add_argument(
-                "--limit", type=int,
-                help="Maximum samples per client in train/dev; default: use all samples",
-            )
         if command == "train-local":
             command_parser.add_argument("--dataset")
     evaluation = commands.add_parser("evaluate")
@@ -106,8 +101,6 @@ def main(argv: list[str] | None = None) -> int:
             config["kind"] = args.command.removeprefix("train-")
             if args.command == "train-local" and args.dataset:
                 config["local_client"] = args.dataset
-            if args.limit is not None:
-                config["limit"] = args.limit
             print(run(config, args.command.removeprefix("train-")))
     except (OSError, ValueError, RuntimeError, yaml.YAMLError, ModuleNotFoundError) as exc:
         parser.error(str(exc))

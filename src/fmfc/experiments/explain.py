@@ -162,7 +162,6 @@ def explain_checkpoint(
         raise ValueError(f"Checkpoint has no private head for {dataset!r}")
     cfg["device"] = str(resolve_device(cfg["device"]))
     cfg["kind"], cfg["local_client"] = "local", dataset
-    cfg["limit"] = None if record_id else limit
     cfg["training"]["batch_size"] = 1
     seed_everything(cfg["seed"])
     batches, label_maps, _ = _real_batches(cfg, split)

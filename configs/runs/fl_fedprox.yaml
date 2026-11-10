@@ -1,0 +1,62 @@
+# FedProx. Giống fl_configs.yaml, chỉ khác khối fl.
+# Chọn prox_mu trên dev, ví dụ {0.001, 0.01, 0.1}; không chọn trên test.
+kind: federated
+use_table_evidence: true
+seed: 42
+device: cuda
+output_root: outputs
+feature_cache_dir: null     # thư mục cache feature frozen; null = không cache
+
+datasets:
+  - id: mocheg
+    path: datasets/mocheg
+  - id: mmcv
+    path: datasets/mmcv
+    subset: all
+    mmqa_path: datasets/mmqa
+    split:
+      ratios: [0.8, 0.1, 0.1]
+      seed: 42
+
+encoders:
+  text:
+    checkpoint_path: roberta-base
+    revision: null
+    max_length: 128
+  evidence:
+    checkpoint_path: allenai/longformer-base-4096
+    revision: null
+    max_length: 512
+  vision:
+    checkpoint_path: openai/clip-vit-base-patch32
+    revision: null
+
+model:
+  hidden_dim: 256
+  num_heads: 8
+  dropout: 0.1
+  cls_dropout: 0.4
+
+max_text_evidence: 4
+max_image_evidence: 2
+max_table_evidence: 2
+max_table_tokens: 1024
+
+training:
+  batch_size: 8
+  epochs: 50
+  learning_rate: 0.0001
+  mode: shared_private
+  private_weight: 0.5
+  logit_adjustment: 1.0     # A6: tau; 0.0 disables
+  patience: 5
+
+evaluation:
+  primary_cohort: all_eligible
+
+fl:
+  algorithm: fedprox
+  weighting: sample
+  prox_mu: 0.01             # mu trong (mu/2)*||theta_k - theta||^2 của loss local
+  rounds: 50
+  local_epochs: 1

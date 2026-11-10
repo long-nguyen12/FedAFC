@@ -76,7 +76,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
         if config.get("kind") in {"local", "centralized"}:
             algorithm = config["kind"]
         seed, comparison = config.get("seed"), config.get("comparison_id")
-        synthetic = metrics.get("synthetic", False)
         dataset_specs = config.get("datasets", [])
         dataset_map = {spec["id"]: _config_key(spec) for spec in dataset_specs}
         dataset_config = _config_key(dataset_specs) if dataset_specs else None
@@ -124,7 +123,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
                     "algorithm": algorithm,
                     "seed": seed,
                     "comparison_id": comparison,
-                    "synthetic": synthetic,
                     "client_id": client_id,
                     "binary_sample_count": count,
                     "binary_macro_f1": score,
@@ -142,7 +140,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
             "local_client": local_client,
             "seed": seed,
             "comparison_id": comparison,
-            "synthetic": synthetic,
             "client_count": len(client_metrics),
             "binary_sample_count": total,
             "mean_client_binary_macro_f1": statistics.mean(observed) if observed else None,
@@ -169,7 +166,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
             for key in (
                 "comparison_id",
                 "seed",
-                "synthetic",
                 "client_id",
                 "client_dataset_config",
                 "model_config",
@@ -200,7 +196,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
                     "algorithm",
                     "local_client",
                     "comparison_id",
-                    "synthetic",
                     "dataset_config",
                     "model_config",
                 )
@@ -218,7 +213,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
                     "algorithm",
                     "local_client",
                     "comparison_id",
-                    "synthetic",
                     "dataset_config",
                     "model_config",
                 ),
@@ -246,7 +240,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
             "local_client",
             "seed",
             "comparison_id",
-            "synthetic",
             "client_count",
             "binary_sample_count",
             "clients_with_binary_metrics",
@@ -266,7 +259,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
             "algorithm",
             "seed",
             "comparison_id",
-            "synthetic",
             "client_id",
             "binary_sample_count",
             "binary_macro_f1",
@@ -285,7 +277,6 @@ def export_results(runs_root: str | Path, output_dir: str | Path) -> dict[str, A
             "algorithm",
             "local_client",
             "comparison_id",
-            "synthetic",
             "seed_count",
             "seeds",
             "mean_client_binary_macro_f1_mean",

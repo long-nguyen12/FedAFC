@@ -6,8 +6,6 @@ EXPERIMENTS = {
     "E03": "Central pooled eligible claims",
     "E04": "FedAvg sample and uniform",
     "E05": "FedProx and FedAdam",
-    "E06": "P1 exposure and uniform-active aggregation",
-    "E07": "Optional P2; empirical justification required",
     "E08": "Claim and text evidence",
     "E09": "Claim and image evidence",
     "E10": "Claim and both evidence types",
