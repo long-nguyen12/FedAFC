@@ -21,6 +21,7 @@ from fmfc.federated.server import ServerState
 from fmfc.model.crosstrans import CrossTransVerifier
 from fmfc.model.encoders import (
     FrozenCLIPImageEncoder,
+    FrozenCLIPTextEncoder,
     FrozenTokenTextEncoder,
 )
 from fmfc.seeds import seed_everything
@@ -59,6 +60,7 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
             "max_grad_norm": 0.0,
             "warmup_steps": 0,
             "logit_adjustment": 0.0,
+            "image_aux_weight": 0.0,
         },
         "fl": {
             "algorithm": "fedavg",
@@ -151,6 +153,11 @@ def _real_batches(
         )
         cache["evidence_encoder"] = FrozenTokenTextEncoder(
             **{**encoders["evidence"], "device": cfg["device"]}
+        )
+        # C3: the claim's CLIP text embedding must share the image encoder's checkpoint.
+        cache["claim_clip_encoder"] = (
+            FrozenCLIPTextEncoder(**{**encoders["vision"], "device": cfg["device"]})
+            if cfg["model"].get("clip_similarity") else None
         )
     text_encoder, vision_encoder = cache["encoders"]
     cfg["model"]["text_dim"] = text_encoder.output_dim
@@ -260,6 +267,7 @@ def _real_batches(
             label_map,
             **budgets,
             cache_dir=cfg.get("feature_cache_dir"),
+            claim_clip_encoder=cache["claim_clip_encoder"],
         )
         clients[dataset] = [
             collator.defer(records[start : start + size], cfg["ablation"], cfg["seed"])
@@ -421,8 +429,11 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             "max_grad_norm",
             "warmup_steps",
             "logit_adjustment",
+            "image_aux_weight",
         )
     }
+    if train_kwargs["image_aux_weight"] and not cfg["model"].get("image_aux_head"):
+        raise ValueError("training.image_aux_weight requires model.image_aux_head: true")
     train_kwargs["device"] = cfg["device"]
     batch_size, reshuffle = (
         cfg["training"]["batch_size"],

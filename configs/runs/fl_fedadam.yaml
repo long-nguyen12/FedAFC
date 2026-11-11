@@ -49,7 +49,7 @@ training:
   mode: shared_private
   private_weight: 0.5
   logit_adjustment: 1.0     # A6: tau; 0.0 disables
-  patience: 5
+  patience: 10
 
 evaluation:
   primary_cohort: all_eligible

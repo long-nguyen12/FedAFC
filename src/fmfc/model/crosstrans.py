@@ -19,20 +19,26 @@ class CrossTransVerifier(Verifier):
         self, text_dim: int, image_dim: int, hidden_dim: int,
         private_labels: dict[str, int], evidence_dim: int | None = None,
         num_heads: int = 8, dropout: float = 0.1, cls_dropout: float = 0.4,
-        table_dim: int | None = None,
+        table_dim: int | None = None, input_norm: bool = False, clip_similarity: bool = False,
+        text_bidirectional: bool = False, table_bidirectional: bool = False,
+        image_aux_head: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         if table_dim is not None and table_dim <= 0:
             raise ValueError("Table feature dimension must be positive")
+        if table_bidirectional and table_dim is None:
+            raise ValueError("table_bidirectional requires table evidence")
         self.hidden_dim = hidden_dim
         self.table_dim = table_dim
         self.claim_video_trans = MultimodalFusionModule(
             text_in_dim=text_dim, img_in_dim=image_dim, d_model=hidden_dim,
             n_heads=num_heads, out_dim=hidden_dim, dropout=dropout, bidirectional=True,
         )
+        # C4: evidence tokens also attend to the claim before pooling.
         self.claim_evidence_trans = MultimodalFusionModule(
             text_in_dim=text_dim, img_in_dim=evidence_dim or text_dim, d_model=hidden_dim,
-            n_heads=num_heads, out_dim=hidden_dim, dropout=dropout, bidirectional=False,
+            n_heads=num_heads, out_dim=hidden_dim, dropout=dropout,
+            bidirectional=text_bidirectional,
         )
         # Upstream reserves `gate` but never calls it. Deleting after construction
         # keeps the RNG stream, hence every other initialization, unchanged.
@@ -51,12 +57,32 @@ class CrossTransVerifier(Verifier):
             # Tables reuse the unidirectional claim<-evidence block and the 2-input gate.
             self.claim_table_trans = MultimodalFusionModule(
                 text_in_dim=text_dim, img_in_dim=table_dim, d_model=hidden_dim,
-                n_heads=num_heads, out_dim=hidden_dim, dropout=dropout, bidirectional=False,
+                n_heads=num_heads, out_dim=hidden_dim, dropout=dropout,
+                bidirectional=table_bidirectional,
             )
             del self.claim_table_trans.gate
             self.table_fusion = MultiHeadGatedFusion(
                 dim1=hidden_dim, dim2=hidden_dim, out_dim=hidden_dim, dropout=dropout,
             )
+        # Optional modules are built last so that, with their flags off, every other
+        # module keeps exactly the same initialization.
+        self.input_norm = input_norm
+        if input_norm:  # C1: frozen-encoder states have a few huge outlier dimensions.
+            self.claim_norm = nn.LayerNorm(text_dim)
+            self.image_norm = nn.LayerNorm(image_dim)
+            self.evidence_norm = nn.LayerNorm(evidence_dim or text_dim)
+            if table_dim is not None:
+                self.table_norm = nn.LayerNorm(table_dim)
+        self.clip_similarity = clip_similarity
+        if clip_similarity:  # C3: zero-initialized, so it starts as a no-op.
+            self.image_similarity = nn.Linear(2, hidden_dim)
+            nn.init.zeros_(self.image_similarity.weight)
+            nn.init.zeros_(self.image_similarity.bias)
+        # C6: an image-only SUPPORT/REFUTE head, trained by training.image_aux_weight,
+        # so the image branch must learn label-relevant content even when text dominates.
+        self.image_aux_head = image_aux_head
+        if image_aux_head:
+            self.image_aux = nn.Linear(hidden_dim, 2)
 
     _LEGACY_KEYS = re.compile(r"^claim_(video|evidence)_trans\.gate\.")
 
@@ -121,6 +147,22 @@ class CrossTransVerifier(Verifier):
             result = result.index_copy(0, only, fusion.norm(fusion.dropout(heads)))
         return result
 
+    def _image_similarity(self, batch: Mapping[str, Any]) -> Tensor:
+        """C3: max and mean CLIP cosine between the claim and its images, zero without images.
+
+        Uses the raw CLIP image embeddings (before input_norm). Shuffling images
+        recomputes it against another claim's images, as the ablation intends.
+        """
+        items = batch["image_mask"].bool()
+        if items.shape[1] == 0:
+            return torch.zeros(items.shape[0], self.hidden_dim, device=items.device)
+        sims = torch.einsum("bd,bnd->bn", batch["claim_clip"], batch["image_features"])
+        best = sims.masked_fill(~items, -1.0).amax(1)
+        mean = (sims * items).sum(1) / items.sum(1).clamp_min(1)
+        # 100 is CLIP's trained logit scale, which puts cosine gaps on a learnable scale.
+        features = 100.0 * torch.stack([best, mean], dim=1)
+        return self.image_similarity(features) * items.any(1, keepdim=True)
+
     def forward(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         table_mask = batch.get("table_mask")
         if self.table_dim is None and table_mask is not None and table_mask.any():
@@ -129,22 +171,32 @@ class CrossTransVerifier(Verifier):
         claim_mask = batch.get("claim_mask")
         if claim_mask is None:
             claim_mask = torch.ones(claim.shape[:2], dtype=torch.bool, device=claim.device)
+        image_tokens, text_tokens = batch["image_features"], batch["text_features"]
+        if self.input_norm:  # _branch re-zeroes padding, so LayerNorm bias never leaks into it
+            claim = self.claim_norm(claim)
+            image_tokens = self.image_norm(image_tokens)
+            text_tokens = self.evidence_norm(text_tokens)
         claim = claim.masked_fill(~claim_mask.unsqueeze(-1), 0)
         visual = self._branch(
             self.claim_video_trans, claim, claim_mask,
-            batch["image_features"], batch["image_mask"].bool(), visual=True,
+            image_tokens, batch["image_mask"].bool(), visual=True,
         )
+        if self.clip_similarity:
+            visual = visual + self._image_similarity(batch)
         evidence = self._branch(
             self.claim_evidence_trans, claim, claim_mask,
-            batch["text_features"], batch["text_mask"].bool(),
+            text_tokens, batch["text_mask"].bool(),
         )
         image_present = batch["image_mask"].bool().any(1)
         text_present = batch["text_mask"].bool().any(1)
         fused = self._fuse_available(visual, evidence, image_present, text_present)
         if self.table_dim is not None and table_mask is not None:
             table_mask = table_mask.bool()
+            table_tokens = batch["table_features"]
+            if self.input_norm:
+                table_tokens = self.table_norm(table_tokens)
             table = self._branch(
-                self.claim_table_trans, claim, claim_mask, batch["table_features"], table_mask,
+                self.claim_table_trans, claim, claim_mask, table_tokens, table_mask,
             )
             fused = self._add_table(fused, table, table_mask.any(1), image_present | text_present)
         fused = self.dropout(fused)
@@ -155,7 +207,7 @@ class CrossTransVerifier(Verifier):
             )
             for dataset in dict.fromkeys(batch["dataset_ids"])
         }
-        return {
+        result = {
             "global_logits": self.classifier(fused),
             "private_logits": {
                 dataset: self.private_heads[dataset](fused[index])
@@ -163,6 +215,9 @@ class CrossTransVerifier(Verifier):
             },
             "private_indices": indices,
         }
+        if self.image_aux_head:  # training-only signal; evaluation uses global_logits
+            result["image_logits"] = self.image_aux(self.dropout(visual))
+        return result
 
     def parameter_groups(self) -> dict[str, str]:
         meanings = {
@@ -175,6 +230,12 @@ class CrossTransVerifier(Verifier):
             "classifier": "global_head",
             "claim_table_trans": "table_evidence",
             "table_fusion": "table_evidence",
+            "claim_norm": "claim_text",  # used by every active row
+            "image_norm": "image_evidence",
+            "evidence_norm": "text_evidence",
+            "table_norm": "table_evidence",
+            "image_similarity": "image_evidence",
+            "image_aux": "image_evidence",
         }
         groups = {}
         for name, parameter in self.named_parameters():

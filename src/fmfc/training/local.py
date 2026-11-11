@@ -70,7 +70,10 @@ def _adjust_logits(
         ]).to(values)
         for dataset, values in outputs["private_logits"].items()
     }
-    return {**outputs, "global_logits": logits + tau * shift, "private_logits": private}
+    adjusted = {**outputs, "global_logits": logits + tau * shift, "private_logits": private}
+    if "image_logits" in outputs:  # C6 head: same prior, so it cannot learn "image => SUPPORT"
+        adjusted["image_logits"] = outputs["image_logits"] + tau * shift.to(outputs["image_logits"])
+    return adjusted
 
 
 def to_device(batch: Mapping[str, Any], device: str | torch.device) -> dict[str, Any]:
@@ -92,6 +95,7 @@ def train_epoch(
     progress_desc: str = "Train", max_grad_norm: float = 0.0, warmup_steps: int = 0,
     logit_adjustment: float = 0.0,
     log_priors: Mapping[PriorKey, Mapping[str, Tensor]] | None = None,
+    image_aux_weight: float = 0.0,
 ) -> dict[str, Any]:
     if mode not in {"binary_only", "shared_private"}:
         raise ValueError("mode must be binary_only or shared_private")
@@ -107,6 +111,8 @@ def train_epoch(
         raise ValueError("warmup_steps must be a nonnegative integer")
     if prox_mu < 0:
         raise ValueError("prox_mu must be nonnegative")
+    if image_aux_weight < 0:
+        raise ValueError("image_aux_weight must be nonnegative")
     if prox_mu and prox_reference is None:
         raise ValueError("FedProx requires a shared reference checkpoint")
     if prox_reference is not None and set(prox_reference) != set(model.parameter_groups()):
@@ -155,7 +161,8 @@ def train_epoch(
         if logit_adjustment:
             outputs = _adjust_logits(outputs, batch, log_priors, logit_adjustment)
         objective = compute_loss(
-            outputs, batch, mode=mode, global_weight=global_weight, private_weight=private_weight
+            outputs, batch, mode=mode, global_weight=global_weight, private_weight=private_weight,
+            image_aux_weight=image_aux_weight,
         )["loss"]
         if prox_mu:
             penalty = sum(

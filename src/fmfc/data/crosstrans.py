@@ -19,6 +19,7 @@ class CrossTransCollator:
         original_label_mapping: dict[str, int], max_text_evidence: int | None = 4,
         max_image_evidence: int | None = 2, max_table_evidence: int | None = None,
         max_table_tokens: int | None = None, cache_dir: str | Path | None = None,
+        claim_clip_encoder: Any = None,
     ) -> None:
         # None means every supplied text piece / image is used.
         if any(budget is not None and budget < 1
@@ -39,6 +40,8 @@ class CrossTransCollator:
         # Frozen features per record. Entries are never invalidated automatically:
         # the user picks a new directory when encoders, budgets or evidence change.
         self.cache_dir = Path(cache_dir) if cache_dir else None
+        # Only for model.clip_similarity; computed per batch, so caches stay valid.
+        self.claim_clip_encoder = claim_clip_encoder
 
     def defer(
         self, records: list[VerificationRecord], ablation: str = "all", seed: int = 42,
@@ -59,7 +62,10 @@ class CrossTransCollator:
         if self.max_table is None and any(self._items(r, "table") for r in records):
             raise ValueError("Table evidence requires a table-enabled CrossTrans collator")
         rows = self._encode_rows(records) if self.cache_dir is None else self._cached_rows(records)
-        return self._assemble(records, rows)
+        result = self._assemble(records, rows)
+        if self.claim_clip_encoder is not None:
+            result["claim_clip"] = self.claim_clip_encoder.encode([r.claim_text for r in records])
+        return result
 
     @staticmethod
     def _items(record: VerificationRecord, kind: str) -> list[Any]:

@@ -168,3 +168,37 @@ class FrozenCLIPImageEncoder:
         inputs = self.processor(images=images, return_tensors="pt").to(self.device)
         features = self.model(**inputs).image_embeds
         return torch.nn.functional.normalize(features, dim=-1).detach().cpu().clone()
+
+
+class FrozenCLIPTextEncoder:
+    """Normalized CLIP text embedding of the claim, in the same space as the image features.
+
+    Load it from the vision encoder's checkpoint so both sides share one CLIP model.
+    CLIP accepts at most 77 tokens; longer claims are cut for this similarity feature only.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str | Path,
+        revision: str | None = None,
+        device: str = "cpu",
+    ) -> None:
+        from transformers import AutoTokenizer, CLIPTextModelWithProjection
+
+        root = str(checkpoint_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(root, revision=revision, local_files_only=True)
+        self.model = CLIPTextModelWithProjection.from_pretrained(
+            root, revision=revision, local_files_only=True,
+        ).to(device)
+        self.model.requires_grad_(False).eval()
+        self.output_dim = self.model.config.projection_dim
+        self.device = device
+        self.fingerprint = f"clip-text:{root}:{revision}:normalized-projection:77"
+
+    @torch.no_grad()
+    def encode(self, texts: Sequence[str]) -> Tensor:
+        tokens = self.tokenizer(
+            list(texts), padding=True, truncation=True, max_length=77, return_tensors="pt",
+        ).to(self.device)
+        embeds = self.model(**tokens).text_embeds
+        return torch.nn.functional.normalize(embeds, dim=-1).detach().cpu().clone()
