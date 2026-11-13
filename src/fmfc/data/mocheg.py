@@ -2,7 +2,7 @@ import os
 
 import pandas as pd
 import cv2
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 DATA_PATH = "/home/jovyan/work/FedAFC/datasets/mocheg"
 

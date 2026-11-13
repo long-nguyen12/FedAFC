@@ -1,11 +1,7 @@
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
-from PIL import Image
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 
 def masked_mean(

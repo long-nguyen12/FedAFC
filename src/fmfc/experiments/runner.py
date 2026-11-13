@@ -4,18 +4,15 @@ import copy
 import csv
 import json
 import random
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from fmfc.config import load_config
 from fmfc.data.crosstrans import CrossTransCollator
 from fmfc.data.schema import EvidenceItem, VerificationRecord
 from fmfc.environment import resolve_device
-from fmfc.experiments.ablations import ablate_batch
 from fmfc.federated.client import ClientState
 from fmfc.federated.server import ServerState
 from fmfc.model.crosstrans import CrossTransVerifier
@@ -306,6 +303,16 @@ def _reshuffled_batches(batches: list[dict], size: int) -> list[dict]:
     ]
 
 
+# Checkpoint selection (user decision 2026-11-13): MOCHEG uses the 3-class macro-F1 of its
+# private head (supported/refuted/NEI); every other dataset uses binary macro-F1.
+SELECTION_HEAD = {"mocheg": "original"}
+
+
+def _selection_column(client: str) -> str:
+    kind = "3class" if SELECTION_HEAD.get(client) == "original" else "binary"
+    return f"{client}_{kind}_macro_f1"
+
+
 def _metrics(
     models: dict[str, CrossTransVerifier],
     data: dict,
@@ -331,8 +338,21 @@ def _metrics(
         for report in reports.values()
         if report["binary"]["macro_f1"] is not None
     ]
+    selection = {
+        client: (
+            report["original"].get(client, {}).get("macro_f1")
+            if SELECTION_HEAD.get(client) == "original"
+            else report["binary"]["macro_f1"]
+        )
+        for client, report in reports.items()
+    }
+    complete = bool(selection) and None not in selection.values()
     return {
         "clients": reports,
+        "selection_rule": "mean over clients of macro-F1: MOCHEG 3-class (private head), "
+        "other datasets binary (global head)",
+        "selection_f1": {_selection_column(client): value for client, value in selection.items()},
+        "selection_score": sum(selection.values()) / len(selection) if complete else None,
         "mean_client_binary_macro_f1": sum(values) / len(values) if values else None,
         "worst_client_binary_macro_f1": min(values) if values else None,
         "selection_split": "dev",
@@ -353,7 +373,6 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     cfg["device"] = resolve_device(cfg["device"])
     seed_everything(cfg["seed"])
     torch.set_num_threads(1)
-    started = time.perf_counter()
     real_cache: dict = {}
     train, labels, _ = _real_batches(cfg, "train", real_cache)
     dev, dev_labels, _ = _real_batches(cfg, "dev", real_cache)
@@ -366,6 +385,13 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         selected = cfg.get("local_client", next(iter(train)))
         train, dev = {selected: train[selected]}, {selected: dev[selected]}
         test = {selected: test[selected]}
+    if any(SELECTION_HEAD.get(client) == "original" for client in train) and not (
+        cfg["training"]["mode"] == "shared_private" and cfg["training"]["private_weight"] > 0
+    ):
+        raise ValueError(
+            "MOCHEG checkpoints are selected by its 3-class private head; "
+            "set training.mode: shared_private and training.private_weight > 0"
+        )
     model_args = {
         **cfg["model"],
         "private_labels": {key: len(value) for key, value in labels.items()},
@@ -508,13 +534,17 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             cfg,
             progress_desc=f"Val | {step_label} {step}/{target}",
         )
-        score = metrics["mean_client_binary_macro_f1"]
+        score = metrics["selection_score"]
+        if score is None:
+            raise ValueError("No dev examples for the checkpoint selection metric")
         improved = score > best
         best, stale = (score, 0) if improved else (best, stale + 1)
         history.append(
             {
                 "step": step,
-                "mean_client_binary_macro_f1": score,
+                "selection_score": score,
+                **metrics["selection_f1"],
+                "mean_client_binary_macro_f1": metrics["mean_client_binary_macro_f1"],
                 "worst_client_binary_macro_f1": metrics["worst_client_binary_macro_f1"],
                 "optimizer_steps": json.dumps(
                     {k: v["optimizer_steps"] for k, v in stats.items()}
@@ -584,101 +614,3 @@ def _load_selected(clients: dict, state: dict, cfg: dict) -> None:
         client.load_state_dict(state["clients"][name])
         if cfg["kind"] == "federated":
             client.broadcast(state["server"]["shared"])
-
-
-def freeze_selection(run_dir: str | Path) -> None:
-    folder = Path(run_dir)
-    if not (folder / "selection.json").is_file():
-        raise ValueError(
-            "freeze-selection requires selection.json from an older run; "
-            "new runs save results and best model weights only"
-        )
-    selection = json.loads((folder / "selection.json").read_text(encoding="utf-8"))
-    _json(
-        folder / "selection_frozen.json",
-        {
-            "selected_step": selection["selected_step"],
-            "frozen_at": datetime.now(UTC).isoformat(),
-        },
-    )
-
-
-def evaluate_run(
-    run_dir: str | Path,
-    split: str = "dev",
-    final: bool = False,
-    ablation: str | None = None,
-) -> dict:
-    folder = Path(run_dir)
-    if (
-        not (folder / "config_resolved.yaml").is_file()
-        or not (folder / "checkpoints" / "selected.pt").is_file()
-    ):
-        raise ValueError(
-            "Re-evaluation requires config and checkpoint files from an older run; "
-            "new runs save results and best model weights only"
-        )
-    cfg = load_config(folder / "config_resolved.yaml")
-    if split not in {"dev", "test"}:
-        raise ValueError("Evaluation split must be dev or test")
-    if split == "test":
-        if ablation:
-            raise ValueError(
-                "Choose and preregister test ablations before final evaluation"
-            )
-        frozen = folder / "selection_frozen.json"
-        if not final or not frozen.is_file():
-            raise ValueError("Test is locked; freeze selection and pass --final")
-        if (folder / "metrics_test.json").exists():
-            raise ValueError("Final test evaluation already exists")
-    elif final:
-        raise ValueError("--final applies only to test")
-    state = torch.load(
-        folder / "checkpoints" / "selected.pt", map_location="cpu", weights_only=True
-    )
-    data, labels, _ = _real_batches(cfg, split)
-    if cfg["kind"] == "local":
-        selected = cfg.get("local_client", next(iter(data)))
-        data = {selected: data[selected]}
-    models = {}
-    for name in data:
-        payload = state["clients"][name if cfg["kind"] == "federated" else "pooled"]
-        local_labels = {
-            key: len(value)
-            for key, value in labels.items()
-            if any(
-                param.startswith(f"private_heads.{key}.") for param in payload["model"]
-            )
-        }
-        model = CrossTransVerifier(**cfg["model"], private_labels=local_labels)
-        model.load_state_dict(payload["model"])
-        if cfg["kind"] == "federated":
-            model.load_shared_state(state["server"]["shared"])
-        models[name] = model
-        if ablation:
-            data[name] = [
-                (
-                    {**batch, "_ablation": ablation}
-                    if "_collator" in batch
-                    else ablate_batch(batch, ablation, cfg["seed"])[0]
-                )
-                for batch in data[name]
-            ]
-    metrics = _metrics(
-        models, data, cfg, progress_desc="Test" if split == "test" else "Val"
-    )
-    metrics["evaluation_split"] = split
-    metrics["ablation"] = ablation or cfg["ablation"]
-    metrics["robustness_only"] = metrics["ablation"] in {
-        "shuffle_image",
-        "drop_image",
-        "drop_table",
-    }
-    metrics["evidence_sufficiency_unknown_after_ablation"] = metrics[
-        "ablation"
-    ] not in {"all", "both"}
-    target = (
-        f"metrics_{split}.json" if not ablation else f"ablation_{split}_{ablation}.json"
-    )
-    _json(folder / target, metrics)
-    return metrics

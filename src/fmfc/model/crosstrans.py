@@ -23,7 +23,7 @@ class CrossTransVerifier(Verifier):
         text_bidirectional: bool = False, table_bidirectional: bool = False,
         image_aux_head: bool = False,
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         if table_dim is not None and table_dim <= 0:
             raise ValueError("Table feature dimension must be positive")
         if table_bidirectional and table_dim is None:

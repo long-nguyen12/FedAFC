@@ -57,10 +57,9 @@ def validate_updates(
         seen.add(update.client_id)
         _count(update.sample_count, "sample_count")
         _count(update.optimizer_steps, "optimizer_steps")
-        required_groups = set(parameter_groups.values())
         for group, count in update.group_counts.items():
             _count(count, f"group_counts[{group}]")
-            
-        for name, reference in state.items():
-            delta = update.delta[name]
+        for name in state:
+            if name not in update.delta:
+                raise KeyError(name)
     return sorted(updates, key=lambda update: update.client_id)
