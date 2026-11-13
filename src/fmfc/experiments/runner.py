@@ -357,12 +357,15 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     real_cache: dict = {}
     train, labels, _ = _real_batches(cfg, "train", real_cache)
     dev, dev_labels, _ = _real_batches(cfg, "dev", real_cache)
+    # Test is evaluated once, on the checkpoint selected on dev; it never drives selection.
+    test, test_labels, _ = _real_batches(cfg, "test", real_cache)
     real_cache.clear()
-    if labels != dev_labels:
-        raise ValueError("Training and dev label vocabularies differ")
+    if not labels == dev_labels == test_labels:
+        raise ValueError("Train, dev and test label vocabularies differ")
     if cfg["kind"] == "local" and len(train) != 1:
         selected = cfg.get("local_client", next(iter(train)))
         train, dev = {selected: train[selected]}, {selected: dev[selected]}
+        test = {selected: test[selected]}
     model_args = {
         **cfg["model"],
         "private_labels": {key: len(value) for key, value in labels.items()},
@@ -548,8 +551,18 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         progress_desc=f"Val | Selected {step_label.lower()} {selected_state['step']}",
     )
     metrics["selected_step"] = selected_state["step"]
+    metrics["evaluation_split"] = "dev"
     _json(folder / "metrics_dev.json", metrics)
-    _json(folder / "metrics.json", {"dev": metrics})
+    test_metrics = _metrics(
+        models,
+        test,
+        cfg,
+        progress_desc=f"Test | Selected {step_label.lower()} {selected_state['step']}",
+    )
+    test_metrics["selected_step"] = selected_state["step"]
+    test_metrics["evaluation_split"] = "test"
+    _json(folder / "metrics_test.json", test_metrics)
+    _json(folder / "metrics.json", {"dev": metrics, "test": test_metrics})
     with (folder / "history.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(history[0]))
         writer.writeheader()

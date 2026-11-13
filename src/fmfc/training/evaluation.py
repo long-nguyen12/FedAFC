@@ -28,6 +28,8 @@ def classification_metrics(
         f1.append(2 * tp / denominator if denominator else 0.0)
     return {
         "sample_count": len(targets), "macro_f1": sum(f1) / num_classes if targets else None,
+        # Accuracy equals micro-F1 for single-label classification.
+        "accuracy": sum(confusion[i][i] for i in range(num_classes)) / len(targets) if targets else None,
         "confusion_matrix": confusion, "class_support": supports,
         "class_coverage": sum(count > 0 for count in supports) / num_classes,
         "per_class_f1": f1,
