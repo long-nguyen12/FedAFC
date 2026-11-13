@@ -177,7 +177,7 @@ def explain_checkpoint(
     cfg["kind"], cfg["local_client"] = "local", dataset
     cfg["training"]["batch_size"] = 1
     seed_everything(cfg["seed"])
-    batches, label_maps, _ = _real_batches(cfg, split)
+    batches, label_maps = _real_batches(cfg, split)
     if len(label_maps[dataset]) != private_labels[dataset]:
         raise ValueError("Dataset label vocabulary size differs from the checkpoint")
     rows = [(raw["_records"][0], raw["_collator"]) for raw in batches[dataset]
