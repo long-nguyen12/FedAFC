@@ -11,7 +11,7 @@ from typing import Any
 import torch
 import yaml
 
-from fmfc.data.crosstrans import CrossTransCollator
+from fmfc.data.dataloader import CrossTransCollator
 from fmfc.data.schema import EvidenceItem, VerificationRecord
 from fmfc.environment import resolve_device
 from fmfc.federated.client import ClientState
@@ -99,6 +99,10 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
         cfg[section] = {**defaults, **cfg.get(section, {})}
     if cfg.get("limit") is not None:
         raise ValueError("limit was removed: runs always use the full train/dev splits")
+    if any(cfg.get(key) is not None for key in ("max_text_evidence", "max_image_evidence")):
+        raise ValueError(
+            "max_text_evidence/max_image_evidence were removed: every text piece and image is used"
+        )
     return cfg
 
 
@@ -312,10 +316,7 @@ def _real_batches(
         selected = cfg.get("local_client", specs[0]["id"])
         specs = [spec for spec in specs if spec["id"] == selected]
     encoders = _encoders(cfg, cache)
-    budgets = {
-        "max_text_evidence": cfg.get("max_text_evidence", 4),
-        "max_image_evidence": cfg.get("max_image_evidence", 2),
-    }
+    budgets = {}  # every text piece and image is used; only tables have a budget
     if cfg["use_table_evidence"]:
         budgets["max_table_evidence"] = cfg.get("max_table_evidence", 2)
         budgets["max_table_tokens"] = cfg.get("max_table_tokens", 1024)

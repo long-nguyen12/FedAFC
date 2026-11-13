@@ -35,8 +35,6 @@ model:
   dropout: 0.1
   cls_dropout: 0.4
 
-max_text_evidence: null     # null = dùng mọi đoạn text evidence
-max_image_evidence: null    # null = dùng mọi ảnh evidence
 max_table_evidence: 2
 max_table_tokens: 1024
 

@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from fmfc.data.crosstrans import CrossTransCollator
+from fmfc.data.dataloader import CrossTransCollator
 from fmfc.data.schema import VerificationRecord, serialize_table_rows
 from fmfc.environment import resolve_device
 from fmfc.model.crosstrans import CrossTransVerifier
@@ -32,7 +32,7 @@ def explain_record(
         raise ValueError("Evidence IDs must be unique within a record")
     selected = []
     counts = {"text": 0, "image": 0, "table": 0}
-    budgets = {"text": collator.max_text, "image": collator.max_image, "table": collator.max_table}
+    budgets = {"text": None, "image": None, "table": collator.max_table}  # only tables are capped
     for item in record.evidence:
         if budgets[item.kind] is None or counts[item.kind] < budgets[item.kind]:
             selected.append(item)
@@ -61,10 +61,7 @@ def explain_record(
             cache[keep] = logits[0].softmax(-1).cpu().tolist()
         return cache[keep]
 
-    def truncated(encoder: Any, text: str, limit: int | None = None) -> bool:
-        limit = encoder.max_length if limit is None else limit
-        if limit is None:  # the collator splits instead of truncating
-            return False
+    def truncated(encoder: Any, text: str, limit: int) -> bool:
         tokens = encoder.tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
         return len(tokens) > limit
 
@@ -103,7 +100,6 @@ def explain_record(
                 "sufficiency": base[target] - predict(keep)[target],
             })
         separator = collator.evidence_encoder.tokenizer.sep_token or "[SEP]"
-        content = f" {separator} ".join(e.text for e in selected if e.kind == "text")
         # B5: the collator joins the selected tables the same way and cuts at max_table_tokens.
         tables = f" {separator} ".join(
             serialize_table_rows(e.table) for e in selected if e.kind == "table"
@@ -120,8 +116,10 @@ def explain_record(
             "excluded_by_budget": [e.evidence_id for e in record.evidence
                                    if e.evidence_id not in selected_ids],
             "token_truncation": {
-                "claim": truncated(collator.claim_encoder, record.claim_text),
-                "text_evidence": bool(content) and truncated(collator.evidence_encoder, content),
+                "claim": truncated(
+                    collator.claim_encoder, record.claim_text, collator.claim_encoder.max_length,
+                ),
+                # Text evidence is never truncated: the collator splits at piece boundaries.
                 **({"table_evidence": bool(tables) and truncated(
                     collator.evidence_encoder, tables, collator.max_table_tokens,
                 )} if collator.max_table is not None else {}),
