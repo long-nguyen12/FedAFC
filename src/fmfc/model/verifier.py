@@ -17,7 +17,13 @@ class Verifier(nn.Module):
         }
 
     def load_shared_state(self, state: Mapping[str, Tensor]) -> None:
+        """A2: refuse mismatched names, shapes or dtypes instead of broadcasting silently."""
         parameters = dict(self.named_parameters())
+        if set(state) != set(self.parameter_groups()):
+            raise ValueError("Shared parameter names differ from this model's shared parameters")
+        for name, value in state.items():
+            if value.shape != parameters[name].shape or value.dtype != parameters[name].dtype:
+                raise ValueError(f"Shared parameter shape/dtype mismatch: {name}")
         with torch.no_grad():
             for name, value in state.items():
                 parameters[name].copy_(value.to(parameters[name].device))

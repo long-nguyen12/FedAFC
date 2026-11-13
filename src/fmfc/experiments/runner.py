@@ -9,12 +9,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 
 from fmfc.data.crosstrans import CrossTransCollator
 from fmfc.data.schema import EvidenceItem, VerificationRecord
 from fmfc.environment import resolve_device
 from fmfc.federated.client import ClientState
 from fmfc.federated.server import ServerState
+from fmfc.model.claim_only import ClaimOnlyVerifier
 from fmfc.model.crosstrans import CrossTransVerifier
 from fmfc.model.encoders import (
     FrozenCLIPImageEncoder,
@@ -66,11 +68,18 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
             "weighting": "sample",
             "prox_mu": 0.01,
             "server_learning_rate": 0.01,
+            # D1: optimizer steps per client per round; an int for every client or a
+            # {client: steps} mapping; None = no limit.
+            "max_local_steps": None,
+            # Keep fusion_mlp.gates and every LayerNorm on each client; aggregate the rest.
+            # Federated runs only; same parameters, only what is sent changes.
+            "local_gates_norms": False,
         },
         "evaluation": {
             "selection_split": "dev",
             "final_split": "test",
             "primary_cohort": "all_eligible",
+            "train_metrics": False,  # B1b: also score the selected checkpoint on train
         },
     }.items():
         cfg[section] = {**defaults, **cfg.get(section, {})}
@@ -82,9 +91,57 @@ def resolve_config(config: dict[str, Any], kind: str = "federated") -> dict[str,
     return cfg
 
 
-def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
+def build_model(cfg: dict[str, Any], private_labels: dict[str, int]):
+    """CrossTrans by default; `model.architecture: claim_only` builds the B3 claim-only control."""
+    args = {key: value for key, value in cfg["model"].items() if key != "architecture"}
+    if cfg["model"].get("architecture", "crosstrans") == "claim_only":
+        return ClaimOnlyVerifier(**args, private_labels=private_labels)
+    return CrossTransVerifier(**args, private_labels=private_labels)
+
+
+def _local_step_budget(budget: Any, client: str) -> int | None:
+    """D1: one budget for every client, or a per-client mapping (missing client = no limit)."""
+    return budget.get(client) if isinstance(budget, dict) else budget
+
+
+def _mmcv_keys(row: tuple) -> list[tuple[str, str]]:
+    """Contents that may not appear in two splits: claim, text, image path, table."""
+    claim, texts, images, _, _, tables = row
+    keys = [("claim", " ".join(claim.casefold().split()))]
+    keys.extend(
+        ("text", " ".join(text.casefold().split()))
+        for text in texts
+        if isinstance(text, str) and text.strip()
+    )
+    keys.extend(("image", path.replace("\\", "/").casefold()) for path in images)
+    keys.extend(
+        ("table", json.dumps(table, sort_keys=True, ensure_ascii=False))
+        for table in tables
+    )
+    return keys
+
+
+def _mmcv_stratum(row: tuple, hops: list[int]) -> tuple[tuple[bool, ...], int]:
+    """M1 stratum: modality combination (as records see it) x hop group {1, 2, 3-4}."""
+    _, texts, images, _, claim_id, tables = row
+    combination = (
+        any(isinstance(text, str) and text.strip() for text in texts),
+        any(isinstance(path, str) and path.strip() for path in images),
+        bool(tables),
+    )
+    return combination, min(hops[claim_id], 3)
+
+
+def _mmcv_splits(
+    claims: list, policy: dict[str, Any], hops: list[int] | None = None,
+) -> dict[str, list]:
     ratios = policy.get("ratios", [])
     seed = policy.get("seed")
+    strategy = policy.get("strategy", "grouped")
+    if strategy not in {"grouped", "grouped_stratified"}:
+        raise ValueError("split.strategy must be grouped or grouped_stratified")
+    if strategy == "grouped_stratified" and hops is None:
+        raise ValueError("split.strategy grouped_stratified needs hop counts")
 
     claims = sorted(claims, key=lambda row: row[4])
     parent = list(range(len(claims)))
@@ -96,19 +153,8 @@ def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
         return index
 
     seen = {}
-    for index, (claim, texts, images, _, _, tables) in enumerate(claims):
-        keys = [("claim", " ".join(claim.casefold().split()))]
-        keys.extend(
-            ("text", " ".join(text.casefold().split()))
-            for text in texts
-            if isinstance(text, str) and text.strip()
-        )
-        keys.extend(("image", path.replace("\\", "/").casefold()) for path in images)
-        keys.extend(
-            ("table", json.dumps(table, sort_keys=True, ensure_ascii=False))
-            for table in tables
-        )
-        for key in keys:
+    for index, row in enumerate(claims):
+        for key in _mmcv_keys(row):
             if key in seen:
                 parent[root(index)] = root(seen[key])
             else:
@@ -120,10 +166,33 @@ def _mmcv_splits(claims: list, policy: dict[str, Any]) -> dict[str, list]:
     random.Random(seed).shuffle(ordered)
     ordered.sort(key=len, reverse=True)
     parts: list[list] = [[], [], []]
-    targets = [len(claims) * ratio for ratio in ratios]
-    for group in ordered:
-        target = max(range(3), key=lambda i: targets[i] - len(parts[i]))
-        parts[target].extend(group)
+    if strategy == "grouped":
+        targets = [len(claims) * ratio for ratio in ratios]
+        for group in ordered:
+            target = max(range(3), key=lambda i: targets[i] - len(parts[i]))
+            parts[target].extend(group)
+    else:
+        # M1: iterative stratification (Sechidis et al., 2011) at group level. A group goes to
+        # the split where most of its claims still fit the per-stratum target: each claim that
+        # fits counts +1, each claim beyond the target -1. Labels are not used. (A relative-need
+        # score instead sent large groups to dev: dev 1,662 claims, T+Tab 3-4 hop 24% in dev.)
+        strata = {row[4]: _mmcv_stratum(row, hops) for row in claims}
+        totals: dict = {}
+        for stratum in strata.values():
+            totals[stratum] = totals.get(stratum, 0) + 1
+        need = {stratum: [count * ratio for ratio in ratios] for stratum, count in totals.items()}
+        assigned = {stratum: [0, 0, 0] for stratum in totals}
+        for group in ordered:
+            counts: dict = {}
+            for row in group:
+                counts[strata[row[4]]] = counts.get(strata[row[4]], 0) + 1
+            target = max(range(3), key=lambda i: sum(
+                2 * min(count, max(need[stratum][i] - assigned[stratum][i], 0)) - count
+                for stratum, count in counts.items()
+            ))
+            parts[target].extend(group)
+            for stratum, count in counts.items():
+                assigned[stratum][target] += count
     return {
         name: sorted(rows, key=lambda row: row[4])
         for name, rows in zip(("train", "dev", "test"), parts, strict=True)
@@ -178,14 +247,18 @@ def _real_batches(
                 )
                 metadata = {"split_protocol": "supplied train/val/test"}
             else:
-                from fmfc.data.mmcv import get_dataset
+                from fmfc.data.mmcv import claim_hops, get_dataset
 
                 claims = get_dataset(
                     spec["path"],
                     subset=spec.get("subset", "all"),
                     mmqa_path=spec.get("mmqa_path"),
                 )
-                parts = _mmcv_splits(claims, spec["split"])
+                hops = (
+                    claim_hops(spec["path"], spec.get("subset", "all"))
+                    if spec["split"].get("strategy") == "grouped_stratified" else None
+                )
+                parts = _mmcv_splits(claims, spec["split"], hops)
                 metadata = {
                     "split_protocol": "grouped claim/text-content/image-path/table-content v2",
                     "split_policy": spec["split"],
@@ -329,10 +402,17 @@ def _metrics(
         )
         for client, batches in data.items()
     }
+    training = cfg["training"]
+    use_private = training["mode"] == "shared_private" and training["private_weight"] > 0
     for report in reports.values():
         report["all_eligible_binary"] = report["binary"]
         if cfg["evaluation"]["primary_cohort"] == "strict_text_image":
             report["binary"] = report["strict_binary"]
+        # Same weighting as the training loss, on raw logits (no logit adjustment / prox / aux).
+        loss = report["loss"]
+        loss["total"] = training["global_weight"] * (loss["global"] or 0.0) + (
+            training["private_weight"] * (loss["private"] or 0.0) if use_private else 0.0
+        )
     values = [
         report["binary"]["macro_f1"]
         for report in reports.values()
@@ -392,11 +472,13 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
             "MOCHEG checkpoints are selected by its 3-class private head; "
             "set training.mode: shared_private and training.private_weight > 0"
         )
-    model_args = {
-        **cfg["model"],
-        "private_labels": {key: len(value) for key, value in labels.items()},
-    }
-    initial = CrossTransVerifier(**model_args).to(cfg["device"])
+    initial = build_model(
+        cfg, {key: len(value) for key, value in labels.items()}
+    ).to(cfg["device"])
+    if cfg["kind"] == "federated" and cfg["fl"]["local_gates_norms"]:
+        if not isinstance(initial, CrossTransVerifier):
+            raise ValueError("fl.local_gates_norms needs model.architecture: crosstrans")
+        initial.local_gates_norms = True  # before the client copies and the server state
     for dataset, head in initial.private_heads.items():
         # Dataset-specific initialization must not depend on client ordering.
         with torch.random.fork_rng(devices=[]):
@@ -448,6 +530,12 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
         raise ValueError("run_id must be a single directory name")
     folder = Path(cfg["output_root"]) / run_id
     folder.mkdir(parents=True, exist_ok=False)
+    # The config as given (overrides applied), so evaluate/explain can rebuild this run.
+    with (folder / "config_used.yaml").open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(
+            {**config, "kind": cfg["kind"], "run_id": run_id},
+            stream, sort_keys=False, allow_unicode=True,
+        )
     target = fl["rounds"] if cfg["kind"] == "federated" else cfg["training"]["epochs"]
     train_kwargs = {
         key: cfg["training"][key]
@@ -498,11 +586,13 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
                     log_priors=priors.get(client_id),
                     progress_desc=f"Train | Round {step + 1}/{target}",
                     prox_mu=fl["prox_mu"] if fl["algorithm"] == "fedprox" else 0.0,
+                    max_steps=_local_step_budget(fl["max_local_steps"], client_id),
                 )
                 updates.append(update)
                 stats[client_id] = {
                     "optimizer_steps": update.optimizer_steps,
                     "sample_count": update.sample_count,
+                    "loss": update.metrics["loss"],
                 }
             shared = server.aggregate(updates)
             for client in clients.values():
@@ -546,6 +636,17 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
                 **metrics["selection_f1"],
                 "mean_client_binary_macro_f1": metrics["mean_client_binary_macro_f1"],
                 "worst_client_binary_macro_f1": metrics["worst_client_binary_macro_f1"],
+                # Train loss: mean training objective of the epoch (includes logit adjustment,
+                # FedProx and C6 terms when on). "pooled" = all training data of a local or
+                # centralized run.
+                **{f"{name}_train_loss": value["loss"] for name, value in stats.items()},
+                # Dev loss: same weighting on raw logits; private = MOCHEG 3-class head.
+                **{
+                    f"{client}_dev_{part}_loss" if part != "total" else f"{client}_dev_loss":
+                    report["loss"][part]
+                    for client, report in metrics["clients"].items()
+                    for part in ("total", "global", "private")
+                },
                 "optimizer_steps": json.dumps(
                     {k: v["optimizer_steps"] for k, v in stats.items()}
                 ),
@@ -592,7 +693,20 @@ def run(config: dict[str, Any], kind: str = "federated") -> Path:
     test_metrics["selected_step"] = selected_state["step"]
     test_metrics["evaluation_split"] = "test"
     _json(folder / "metrics_test.json", test_metrics)
-    _json(folder / "metrics.json", {"dev": metrics, "test": test_metrics})
+    combined = {"dev": metrics, "test": test_metrics}
+    if cfg["evaluation"]["train_metrics"]:
+        # B1b: raw logits on the training data, to tell underfitting from overfitting.
+        train_metrics = _metrics(
+            models,
+            train,
+            cfg,
+            progress_desc=f"Train eval | Selected {step_label.lower()} {selected_state['step']}",
+        )
+        train_metrics["selected_step"] = selected_state["step"]
+        train_metrics["evaluation_split"] = "train"
+        _json(folder / "metrics_train.json", train_metrics)
+        combined["train"] = train_metrics
+    _json(folder / "metrics.json", combined)
     with (folder / "history.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(history[0]))
         writer.writeheader()
@@ -614,3 +728,42 @@ def _load_selected(clients: dict, state: dict, cfg: dict) -> None:
         client.load_state_dict(state["clients"][name])
         if cfg["kind"] == "federated":
             client.broadcast(state["server"]["shared"])
+
+
+def evaluate_run(
+    run_dir: str | Path, split: str = "test", ablation: str | None = None,
+    config: str | Path | None = None,
+) -> Path:
+    """B2: re-score the dev-selected best_model.pt of a finished run; selection is untouched.
+
+    Without ``ablation`` the run's own setting is used and metrics_<split>.json is written;
+    with one, metrics_<split>_<ablation>.json. An existing file is never overwritten.
+    """
+    folder = Path(run_dir)
+    if split not in {"train", "dev", "test"}:
+        raise ValueError("split must be train, dev or test")
+    output = folder / f"metrics_{split}{'' if ablation is None else f'_{ablation}'}.json"
+    if output.exists():
+        raise ValueError(f"{output} already exists and is never overwritten")
+    path = Path(config) if config is not None else folder / "config_used.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if ablation is not None:
+        raw["ablation"] = ablation
+    cfg = resolve_config(raw, raw.get("kind", "federated"))
+    cfg["device"] = resolve_device(cfg["device"])
+    data, labels, _ = _real_batches(cfg, split)
+    payload = torch.load(folder / "best_model.pt", map_location="cpu", weights_only=True)
+    models = {}
+    for client in data:
+        if cfg["kind"] == "federated":  # each client model keeps only its own private head
+            heads, state = {client: len(labels[client])}, payload["models"][client]
+        else:  # local / centralized: one pooled model with a head per loaded dataset
+            heads = {name: len(value) for name, value in labels.items()}
+            state = payload["models"]["pooled"]
+        model = build_model(cfg, heads)
+        model.load_state_dict(state, strict=True)
+        models[client] = model.to(cfg["device"])
+    metrics = _metrics(models, data, cfg, progress_desc=f"Eval {split} | {folder.name}")
+    metrics.update(selected_step=payload["step"], evaluation_split=split)
+    _json(output, metrics)
+    return output

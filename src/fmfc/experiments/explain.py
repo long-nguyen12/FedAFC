@@ -7,7 +7,7 @@ from typing import Any
 import torch
 
 from fmfc.data.crosstrans import CrossTransCollator
-from fmfc.data.schema import VerificationRecord
+from fmfc.data.schema import VerificationRecord, serialize_table_rows
 from fmfc.environment import resolve_device
 from fmfc.model.crosstrans import CrossTransVerifier
 
@@ -25,13 +25,14 @@ def explain_record(
     """
     if head not in {"global", "original"} or top_k < 1:
         raise ValueError("head must be global/original and top_k must be positive")
-    if any(item.kind not in {"text", "image"} for item in record.evidence):
-        raise ValueError("CrossTrans explanations support text/image evidence only")
+    kinds = {"text", "image"} | ({"table"} if collator.max_table is not None else set())
+    if any(item.kind not in kinds for item in record.evidence):
+        raise ValueError(f"CrossTrans explanations support {sorted(kinds)} evidence only")
     if len({item.evidence_id for item in record.evidence}) != len(record.evidence):
         raise ValueError("Evidence IDs must be unique within a record")
     selected = []
-    counts = {"text": 0, "image": 0}
-    budgets = {"text": collator.max_text, "image": collator.max_image}
+    counts = {"text": 0, "image": 0, "table": 0}
+    budgets = {"text": collator.max_text, "image": collator.max_image, "table": collator.max_table}
     for item in record.evidence:
         if budgets[item.kind] is None or counts[item.kind] < budgets[item.kind]:
             selected.append(item)
@@ -60,11 +61,12 @@ def explain_record(
             cache[keep] = logits[0].softmax(-1).cpu().tolist()
         return cache[keep]
 
-    def truncated(encoder: Any, text: str) -> bool:
-        if encoder.max_length is None:  # the collator splits instead of truncating
+    def truncated(encoder: Any, text: str, limit: int | None = None) -> bool:
+        limit = encoder.max_length if limit is None else limit
+        if limit is None:  # the collator splits instead of truncating
             return False
         tokens = encoder.tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
-        return len(tokens) > encoder.max_length
+        return len(tokens) > limit
 
     was_training = model.training
     model.eval()
@@ -102,6 +104,10 @@ def explain_record(
             })
         separator = collator.evidence_encoder.tokenizer.sep_token or "[SEP]"
         content = f" {separator} ".join(e.text for e in selected if e.kind == "text")
+        # B5: the collator joins the selected tables the same way and cuts at max_table_tokens.
+        tables = f" {separator} ".join(
+            serialize_table_rows(e.table) for e in selected if e.kind == "table"
+        )
         return {
             "record_id": record.record_id, "dataset_id": record.dataset_id,
             "split": record.split, "claim_text": record.claim_text,
@@ -116,6 +122,9 @@ def explain_record(
             "token_truncation": {
                 "claim": truncated(collator.claim_encoder, record.claim_text),
                 "text_evidence": bool(content) and truncated(collator.evidence_encoder, content),
+                **({"table_evidence": bool(tables) and truncated(
+                    collator.evidence_encoder, tables, collator.max_table_tokens,
+                )} if collator.max_table is not None else {}),
             },
             "forward_passes": len(cache),
         }
@@ -140,13 +149,15 @@ def explain_checkpoint(
     if head not in {"global", "original"}:
         raise ValueError("head must be global or original")
     cfg = resolve_config(config)
+    if cfg["model"].pop("architecture", "crosstrans") != "crosstrans":
+        raise ValueError("Explain supports CrossTrans only; the claim-only control ignores evidence")
     # Removal re-encodes evidence subsets under the same record_id; a cache would
     # return the full-evidence features instead.
     cfg.pop("feature_cache_dir", None)
     if dataset not in {spec["id"] for spec in cfg.get("datasets", [])}:
         raise ValueError(f"Dataset {dataset!r} is not in the supplied config")
     if cfg["ablation"] not in {"all", "both"}:
-        raise ValueError("Explain requires a config using all supplied text/image evidence")
+        raise ValueError("Explain requires a config using all supplied evidence")
     if head == "original" and (cfg["training"]["mode"] != "shared_private"
                                or cfg["training"]["private_weight"] <= 0):
         raise ValueError("Original-label explanations require a trained private head")

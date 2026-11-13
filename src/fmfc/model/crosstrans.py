@@ -16,56 +16,78 @@ from fmfc.model.verifier import Verifier
 
 class CrossTransVerifier(Verifier):
     def __init__(
-        self, text_dim: int, image_dim: int, hidden_dim: int,
-        private_labels: dict[str, int], evidence_dim: int | None = None,
-        num_heads: int = 8, dropout: float = 0.1, cls_dropout: float = 0.4,
-        table_dim: int | None = None, input_norm: bool = False, clip_similarity: bool = False,
-        text_bidirectional: bool = False, table_bidirectional: bool = False,
+        self,
+        text_dim: int,
+        image_dim: int,
+        hidden_dim: int,
+        private_labels: dict[str, int],
+        evidence_dim: int | None = None,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        cls_dropout: float = 0.4,
+        table_dim: int | None = None,
+        input_norm: bool = False,
+        clip_similarity: bool = False,
+        text_bidirectional: bool = False,
+        table_bidirectional: bool = False,
         image_aux_head: bool = False,
     ) -> None:
         super().__init__()
-        if table_dim is not None and table_dim <= 0:
-            raise ValueError("Table feature dimension must be positive")
-        if table_bidirectional and table_dim is None:
-            raise ValueError("table_bidirectional requires table evidence")
+
         self.hidden_dim = hidden_dim
         self.table_dim = table_dim
         self.claim_video_trans = MultimodalFusionModule(
-            text_in_dim=text_dim, img_in_dim=image_dim, d_model=hidden_dim,
-            n_heads=num_heads, out_dim=hidden_dim, dropout=dropout, bidirectional=True,
+            text_in_dim=text_dim,
+            img_in_dim=image_dim,
+            d_model=hidden_dim,
+            n_heads=num_heads,
+            out_dim=hidden_dim,
+            dropout=dropout,
+            bidirectional=True,
         )
-        # C4: evidence tokens also attend to the claim before pooling.
+
         self.claim_evidence_trans = MultimodalFusionModule(
-            text_in_dim=text_dim, img_in_dim=evidence_dim or text_dim, d_model=hidden_dim,
-            n_heads=num_heads, out_dim=hidden_dim, dropout=dropout,
+            text_in_dim=text_dim,
+            img_in_dim=evidence_dim or text_dim,
+            d_model=hidden_dim,
+            n_heads=num_heads,
+            out_dim=hidden_dim,
+            dropout=dropout,
             bidirectional=text_bidirectional,
         )
-        # Upstream reserves `gate` but never calls it. Deleting after construction
-        # keeps the RNG stream, hence every other initialization, unchanged.
-        del self.claim_video_trans.gate
-        del self.claim_evidence_trans.gate
+
         self.fusion_mlp = MultiHeadGatedFusion(
-            dim1=hidden_dim, dim2=hidden_dim, out_dim=hidden_dim, dropout=dropout,
+            dim1=hidden_dim,
+            dim2=hidden_dim,
+            out_dim=hidden_dim,
+            dropout=dropout,
         )
         self.dropout = nn.Dropout(cls_dropout)
         self.classifier = nn.Linear(hidden_dim, 2)
-        self.private_heads = nn.ModuleDict({
-            dataset: nn.Linear(hidden_dim, count) for dataset, count in private_labels.items()
-        })
+        self.private_heads = nn.ModuleDict(
+            {
+                dataset: nn.Linear(hidden_dim, count)
+                for dataset, count in private_labels.items()
+            }
+        )
         if table_dim is not None:
-            # Built last, so every text/image module keeps its table-free initialization.
-            # Tables reuse the unidirectional claim<-evidence block and the 2-input gate.
             self.claim_table_trans = MultimodalFusionModule(
-                text_in_dim=text_dim, img_in_dim=table_dim, d_model=hidden_dim,
-                n_heads=num_heads, out_dim=hidden_dim, dropout=dropout,
+                text_in_dim=text_dim,
+                img_in_dim=table_dim,
+                d_model=hidden_dim,
+                n_heads=num_heads,
+                out_dim=hidden_dim,
+                dropout=dropout,
                 bidirectional=table_bidirectional,
             )
-            del self.claim_table_trans.gate
+
             self.table_fusion = MultiHeadGatedFusion(
-                dim1=hidden_dim, dim2=hidden_dim, out_dim=hidden_dim, dropout=dropout,
+                dim1=hidden_dim,
+                dim2=hidden_dim,
+                out_dim=hidden_dim,
+                dropout=dropout,
             )
-        # Optional modules are built last so that, with their flags off, every other
-        # module keeps exactly the same initialization.
+
         self.input_norm = input_norm
         if input_norm:  # C1: frozen-encoder states have a few huge outlier dimensions.
             self.claim_norm = nn.LayerNorm(text_dim)
@@ -83,19 +105,28 @@ class CrossTransVerifier(Verifier):
         self.image_aux_head = image_aux_head
         if image_aux_head:
             self.image_aux = nn.Linear(hidden_dim, 2)
-
-    _LEGACY_KEYS = re.compile(r"^claim_(video|evidence)_trans\.gate\.")
+        # fl.local_gates_norms (set by the runner for federated runs): fusion_mlp.gates and
+        # every LayerNorm stay on the client. No parameter is added; only what is sent changes.
+        self.local_gates_norms = False
 
     def load_state_dict(
-        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False,
+        self,
+        state_dict: Mapping[str, Any],
+        strict: bool = True,
+        assign: bool = False,
     ):
         """Accept checkpoints saved before the unused upstream gates were removed."""
-        state_dict = {k: v for k, v in state_dict.items() if not self._LEGACY_KEYS.match(k)}
+        state_dict = {k: v for k, v in state_dict.items()}
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _branch(
-        self, module: nn.Module, claim: Tensor, claim_mask: Tensor,
-        evidence: Tensor, evidence_mask: Tensor, visual: bool = False,
+        self,
+        module: nn.Module,
+        claim: Tensor,
+        claim_mask: Tensor,
+        evidence: Tensor,
+        evidence_mask: Tensor,
+        visual: bool = False,
     ) -> Tensor:
         indices = evidence_mask.any(1).nonzero(as_tuple=True)[0]
         result = claim.new_zeros(claim.shape[0], self.hidden_dim)
@@ -103,14 +134,19 @@ class CrossTransVerifier(Verifier):
             return result
         tokens = evidence[indices].masked_fill(~evidence_mask[indices].unsqueeze(-1), 0)
         fused = module(
-            text_tokens=claim[indices], img_tokens=tokens,
-            text_mask=claim_mask[indices], img_mask=evidence_mask[indices],
+            text_tokens=claim[indices],
+            img_tokens=tokens,
+            text_mask=claim_mask[indices],
+            img_mask=evidence_mask[indices],
         )
         return result.index_copy(0, indices, fused)
 
     def _fuse_available(
-        self, visual: Tensor, evidence: Tensor,
-        image_present: Tensor, text_present: Tensor,
+        self,
+        visual: Tensor,
+        evidence: Tensor,
+        image_present: Tensor,
+        text_present: Tensor,
     ) -> Tensor:
         """Route missing modalities around biased projections and joint gates."""
         fusion = self.fusion_mlp
@@ -125,7 +161,8 @@ class CrossTransVerifier(Verifier):
             indices = present.nonzero(as_tuple=True)[0]
             if indices.numel():
                 heads = torch.cat(
-                    [projection(features[indices]) for projection in projections], dim=-1,
+                    [projection(features[indices]) for projection in projections],
+                    dim=-1,
                 )
                 fused = fusion.norm(fusion.dropout(heads))
                 result = result.index_copy(0, indices, fused)
@@ -133,7 +170,11 @@ class CrossTransVerifier(Verifier):
         return result
 
     def _add_table(
-        self, fused: Tensor, table: Tensor, table_present: Tensor, other_present: Tensor,
+        self,
+        fused: Tensor,
+        table: Tensor,
+        table_present: Tensor,
+        other_present: Tensor,
     ) -> Tensor:
         """Gate tables into the text/image result; rows without a table are unchanged."""
         fusion = self.table_fusion
@@ -143,7 +184,9 @@ class CrossTransVerifier(Verifier):
         if both.numel():
             result = result.index_copy(0, both, fusion(fused[both], table[both]))
         if only.numel():
-            heads = torch.cat([projection(table[only]) for projection in fusion.proj2], dim=-1)
+            heads = torch.cat(
+                [projection(table[only]) for projection in fusion.proj2], dim=-1
+            )
             result = result.index_copy(0, only, fusion.norm(fusion.dropout(heads)))
         return result
 
@@ -170,22 +213,33 @@ class CrossTransVerifier(Verifier):
         claim = batch["claim_features"]
         claim_mask = batch.get("claim_mask")
         if claim_mask is None:
-            claim_mask = torch.ones(claim.shape[:2], dtype=torch.bool, device=claim.device)
+            claim_mask = torch.ones(
+                claim.shape[:2], dtype=torch.bool, device=claim.device
+            )
         image_tokens, text_tokens = batch["image_features"], batch["text_features"]
-        if self.input_norm:  # _branch re-zeroes padding, so LayerNorm bias never leaks into it
+        if (
+            self.input_norm
+        ):  # _branch re-zeroes padding, so LayerNorm bias never leaks into it
             claim = self.claim_norm(claim)
             image_tokens = self.image_norm(image_tokens)
             text_tokens = self.evidence_norm(text_tokens)
         claim = claim.masked_fill(~claim_mask.unsqueeze(-1), 0)
         visual = self._branch(
-            self.claim_video_trans, claim, claim_mask,
-            image_tokens, batch["image_mask"].bool(), visual=True,
+            self.claim_video_trans,
+            claim,
+            claim_mask,
+            image_tokens,
+            batch["image_mask"].bool(),
+            visual=True,
         )
         if self.clip_similarity:
             visual = visual + self._image_similarity(batch)
         evidence = self._branch(
-            self.claim_evidence_trans, claim, claim_mask,
-            text_tokens, batch["text_mask"].bool(),
+            self.claim_evidence_trans,
+            claim,
+            claim_mask,
+            text_tokens,
+            batch["text_mask"].bool(),
         )
         image_present = batch["image_mask"].bool().any(1)
         text_present = batch["text_mask"].bool().any(1)
@@ -196,14 +250,21 @@ class CrossTransVerifier(Verifier):
             if self.input_norm:
                 table_tokens = self.table_norm(table_tokens)
             table = self._branch(
-                self.claim_table_trans, claim, claim_mask, table_tokens, table_mask,
+                self.claim_table_trans,
+                claim,
+                claim_mask,
+                table_tokens,
+                table_mask,
             )
-            fused = self._add_table(fused, table, table_mask.any(1), image_present | text_present)
+            fused = self._add_table(
+                fused, table, table_mask.any(1), image_present | text_present
+            )
         fused = self.dropout(fused)
         indices = {
             dataset: torch.tensor(
                 [i for i, value in enumerate(batch["dataset_ids"]) if value == dataset],
-                dtype=torch.long, device=claim.device,
+                dtype=torch.long,
+                device=claim.device,
             )
             for dataset in dict.fromkeys(batch["dataset_ids"])
         }
@@ -219,7 +280,13 @@ class CrossTransVerifier(Verifier):
             result["image_logits"] = self.image_aux(self.dropout(visual))
         return result
 
-    def parameter_groups(self) -> dict[str, str]:
+    def parameter_groups(self, include_local: bool = False) -> dict[str, str]:
+        """Shared parameters and their meaning group.
+
+        With ``local_gates_norms`` the client-local parameters are left out, so they are
+        never sent, aggregated or broadcast; ``include_local=True`` still lists them, for
+        the per-group exposure counts and the inactive-branch gradient rule in training.
+        """
         meanings = {
             "claim_video_trans": "image_evidence",
             "claim_evidence_trans": "text_evidence",
@@ -245,4 +312,12 @@ class CrossTransVerifier(Verifier):
             if prefix == "fusion_mlp":
                 prefix = ".".join(name.split(".")[:2])
             groups[name] = meanings[prefix]
+        if self.local_gates_norms and not include_local:
+            norms = {
+                name for name, module in self.named_modules() if isinstance(module, nn.LayerNorm)
+            }
+            groups = {
+                name: group for name, group in groups.items()
+                if not name.startswith("fusion_mlp.gates.") and name.rsplit(".", 1)[0] not in norms
+            }
         return groups

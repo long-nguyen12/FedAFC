@@ -54,12 +54,19 @@ def validate_updates(
     validate_shared(state, parameter_groups)
     seen: set[str] = set()
     for update in updates:
+        if update.client_id in seen:
+            raise ValueError(f"Duplicate client update: {update.client_id}")
         seen.add(update.client_id)
         _count(update.sample_count, "sample_count")
         _count(update.optimizer_steps, "optimizer_steps")
+        if dict(update.parameter_groups) != dict(parameter_groups):
+            raise ValueError(f"Parameter group partition differs for {update.client_id}")
         for group, count in update.group_counts.items():
             _count(count, f"group_counts[{group}]")
-        for name in state:
-            if name not in update.delta:
-                raise KeyError(name)
+        if set(update.delta) != set(state):
+            raise ValueError(f"Delta names differ for {update.client_id}")
+        for name, reference in state.items():
+            delta = update.delta[name]
+            if delta.shape != reference.shape or not torch.isfinite(delta).all():
+                raise ValueError(f"Invalid delta for {name} from {update.client_id}")
     return sorted(updates, key=lambda update: update.client_id)

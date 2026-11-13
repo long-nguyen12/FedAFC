@@ -51,6 +51,8 @@ class ClientState:
         local_batches = list(batches)
         train_kwargs.setdefault("prox_reference", self._anchor)
         progress_desc = train_kwargs.pop("progress_desc", "Train")
+        budget = train_kwargs.pop("max_steps", None)  # D1: optimizer steps per round, all epochs
+        epochs_run = 0
         totals: dict[str, Any] = {
             "loss": 0.0,
             "sample_count": 0,
@@ -58,18 +60,23 @@ class ClientState:
             "group_counts": dict.fromkeys(set(self.model.parameter_groups().values()), 0),
         }
         for epoch in range(epochs):
+            remaining = None if budget is None else budget - totals["optimizer_steps"]
+            if remaining is not None and remaining <= 0:
+                break
             stats = train_epoch(
                 self.model, local_batches, self.optimizer, **train_kwargs,
+                max_steps=remaining,
                 progress_desc=(
                     f"{progress_desc} | {self.client_id} | Epoch {epoch + 1}/{epochs}"
                 ),
             )
+            epochs_run += 1
             for key in ("sample_count", "optimizer_steps"):
                 totals[key] += stats[key]
             totals["loss"] += stats["loss"]
             for group, count in stats["group_counts"].items():
                 totals["group_counts"][group] = totals["group_counts"].get(group, 0) + count
-        totals["loss"] /= epochs
+        totals["loss"] /= max(epochs_run, 1)
         return self.export_update(totals)
 
     def state_dict(self) -> dict[str, Any]:

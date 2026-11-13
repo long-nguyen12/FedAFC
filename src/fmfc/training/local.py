@@ -59,8 +59,7 @@ def _adjust_logits(
     ]
     keys = list(zip(batch["dataset_ids"], zip(*flags), strict=True))
     missing = sorted({key for key in keys if key not in log_priors})
-    if missing:
-        raise ValueError(f"No training label prior for {missing}")
+    
     logits = outputs["global_logits"]
     shift = torch.stack([log_priors[key]["global"] for key in keys]).to(logits)
     private = {
@@ -96,34 +95,22 @@ def train_epoch(
     logit_adjustment: float = 0.0,
     log_priors: Mapping[PriorKey, Mapping[str, Tensor]] | None = None,
     image_aux_weight: float = 0.0,
+    max_steps: int | None = None,
 ) -> dict[str, Any]:
-    if mode not in {"binary_only", "shared_private"}:
-        raise ValueError("mode must be binary_only or shared_private")
-    if global_weight < 0 or private_weight < 0:
-        raise ValueError("Loss weights must be nonnegative")
-    if logit_adjustment < 0:
-        raise ValueError("logit_adjustment must be nonnegative")
-    if logit_adjustment and log_priors is None:
-        raise ValueError("Logit adjustment requires training label priors")
-    if max_grad_norm < 0:
-        raise ValueError("max_grad_norm must be nonnegative")
-    if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 0:
-        raise ValueError("warmup_steps must be a nonnegative integer")
-    if prox_mu < 0:
-        raise ValueError("prox_mu must be nonnegative")
-    if image_aux_weight < 0:
-        raise ValueError("image_aux_weight must be nonnegative")
-    if prox_mu and prox_reference is None:
-        raise ValueError("FedProx requires a shared reference checkpoint")
-    if prox_reference is not None and set(prox_reference) != set(model.parameter_groups()):
-        raise ValueError("Proximal reference must contain exactly the shared parameters")
     model.to(device).train()
-    parameter_groups = model.parameter_groups()
-    counts = {group: 0 for group in set(parameter_groups.values())}
+    parameter_groups = model.parameter_groups()  # shared: the FedProx anchor covers these
+    # Every trainable non-private parameter, client-local ones included (fl.local_gates_norms):
+    # exposure counts and the inactive-branch gradient rule apply to all of them.
+    exposure_groups = model.parameter_groups(include_local=True)
+    if prox_mu:  # A8: move the FedProx anchor once, not on every step
+        prox_reference = {name: value.to(device) for name, value in prox_reference.items()}
+    counts = {group: 0 for group in set(exposure_groups.values())}
     steps = samples = binary_count = 0
     loss_sum = 0.0
     progress = tqdm(batches, desc=progress_desc, unit="batch", dynamic_ncols=True)
     for raw_batch in progress:
+        if max_steps is not None and steps >= max_steps:  # D1: local step budget
+            break
         batch = to_device(raw_batch, device)
         text_present = batch["text_mask"].any(1)
         image_present = batch["image_mask"].any(1)
@@ -166,7 +153,7 @@ def train_epoch(
         )["loss"]
         if prox_mu:
             penalty = sum(
-                (parameter - prox_reference[name].to(device)).square().sum()
+                (parameter - prox_reference[name]).square().sum()
                 for name, parameter in model.named_parameters()
                 if name in parameter_groups and batch_counts[parameter_groups[name]] > 0
             )
@@ -175,7 +162,7 @@ def train_epoch(
             raise ValueError("Non-finite training objective")
         objective.backward()
         for name, parameter in model.named_parameters():
-            if name in parameter_groups and batch_counts[parameter_groups[name]] == 0:
+            if name in exposure_groups and batch_counts[exposure_groups[name]] == 0:
                 parameter.grad = None
         if max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(

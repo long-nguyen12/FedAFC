@@ -43,14 +43,16 @@ max_table_tokens: 1024
 training:
   batch_size: 8
   epochs: 50
-  learning_rate: 0.0001
+  learning_rate: 0.0001     # S4: giữ 1e-4, bằng AdamW lr của repo MCVE
   mode: shared_private
   private_weight: 0.5
   logit_adjustment: 1.0     # A6: tau; 0.0 disables
   patience: 10
+  reshuffle_records: true   # A9: xáo record và chia batch lại mỗi epoch/round
 
 evaluation:
   primary_cohort: all_eligible
+  train_metrics: true       # B1b: chấm checkpoint đã chọn trên train (metrics_train.json)
 
 fl:
   algorithm: fedavg

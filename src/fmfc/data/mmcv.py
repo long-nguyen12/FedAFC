@@ -18,13 +18,12 @@ def read_text_evidence_corpus(path):
 
 
 def read_table_evidence_corpus(path):
-    """Canonical {title, header, rows} tables; cell links and column metadata are dropped."""
     tables = {}
     with open(os.path.join(path, "MMQA_tables.jsonl"), encoding="utf-8") as stream:
         for line in stream:
             row = json.loads(line)
             table = row["table"]
-            # Page title and section name say what the table is about; neither is a verdict.
+
             title = " | ".join(
                 part.strip() for part in (row.get("title"), table.get("table_name"))
                 if isinstance(part, str) and part.strip()
@@ -62,7 +61,6 @@ def retrieve_data_for_verification(claims, text_evidence, image_evidence, table_
         image_evidences = image_data.loc[row["image_evidence"]].values
         table_evidences = tuple(table_evidence[table_id] for table_id in row["table_evidence"])
 
-        # MMCV has no claim ID; use the row index in the selected source file.
         claim_object = (
             row["claim"],
             text_evidences,
@@ -76,12 +74,18 @@ def retrieve_data_for_verification(claims, text_evidence, image_evidence, table_
     return claim_data
 
 
-def get_dataset(path, subset="all", mmqa_path=None):
-    """Return every claim as (claim, texts, images, label, claim_id, tables).
+def claim_hops(path, subset="all"):
+    """Hop count per claim_id (M1). mmcv_all.json is 1hop..4hop.json concatenated in order."""
+    if subset != "all":
+        return [int(subset.removesuffix("hop"))] * len(read_text_corpus(path, subset))
+    claims = read_text_corpus(path)["claim"].tolist()
+    parts = [read_text_corpus(path, f"{hop}hop")["claim"].tolist() for hop in (1, 2, 3, 4)]
+    if [claim for part in parts for claim in part] != claims:
+        raise ValueError("mmcv_all.json is not 1hop..4hop.json in order; hop counts unknown")
+    return [hop for hop, part in zip((1, 2, 3, 4), parts) for _ in part]
 
-    MMCV supplies hop subsets, not train/dev/test splits. Use subset="all"
-    or "1hop" through "4hop". The first five fields keep the MOCHEG tuple layout.
-    """
+
+def get_dataset(path, subset="all", mmqa_path=None):
     if mmqa_path is None:
         mmqa_path = os.path.join(os.path.dirname(os.path.normpath(path)), "mmqa")
 

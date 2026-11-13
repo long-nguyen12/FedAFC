@@ -19,15 +19,12 @@ def read_text_corpus(path):
     return (train_data, val_data, test_data)
 
 
-IMAGE_EXTENSIONS = ("jpg", "jpeg", "png")
+# M2 (13/11/2026): jfif, bmp and tif are read too (PIL opens all 31 such files).
+# ".jpg__" and extensionless files are still skipped until their content is checked.
+IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "jfif", "bmp", "tif")
 
 
 def image_files(path):
-    """Image paths in the order glob gives on Windows, on any OS.
-
-    Per extension (jpg, then jpeg, then png), matched case-insensitively and
-    sorted case-insensitively, so Linux reads the same files in the same order.
-    """
     names = os.listdir(path)
     return [
         os.path.join(path, name)
@@ -40,7 +37,6 @@ def image_files(path):
 
 
 def read_image(path):
-    # imdir = 'path/to/files/'
     files = image_files(path)
     images = []
     names = []
@@ -50,9 +46,7 @@ def read_image(path):
         names.append(os.path.basename(f))
         claim.append(int(os.path.basename(f).split("-")[0]))
         images.append(cv2.imread(f))
-
-    # images = [cv2.imread(file) for file in files]
-    #
+        
     return pd.DataFrame({"claim_id": claim, "id": names, "image": images})
 
 
@@ -66,9 +60,7 @@ def read_image_path_only(path):
         names.append(os.path.basename(f))
         claim.append(int(os.path.basename(f).split("-")[0]))
         images.append(f)
-
-    # images = [cv2.imread(file) for file in files]
-    #
+        
     return pd.DataFrame({"claim_id": claim, "id": names, "image": images})
 
 

@@ -124,9 +124,6 @@ class MultimodalFusionModule(nn.Module):
                 [CrossAttention(d_model, n_heads, dropout) for _ in range(num_layers)]
             )
 
-        # Reserved for potential gating; not used in forward.
-        self.gate = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.Sigmoid())
-
         self.fuse_mlp = MLP(
             in_dim=2 * d_model,
             hidden_dims=(d_model,),
